@@ -1,0 +1,135 @@
+[
+  {
+    "name": "status toBe pass",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": { "content-type": "application/json" }, "time": 42, "bodyText": "{\"id\":7,\"name\":\"ada\",\"tags\":[\"a\",\"b\"]}" },
+    "variables": {},
+    "code": "test('status is 200', () => { expect(response.status).toBe(200); });"
+  },
+  {
+    "name": "status toBe fail",
+    "mode": "validate",
+    "response": { "status": 500, "statusText": "Server Error", "headers": {}, "time": 42, "bodyText": "" },
+    "variables": {},
+    "code": "test('status is 200', () => { expect(response.status).toBe(200); });"
+  },
+  {
+    "name": "toEqual object pass and fail",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "{\"a\":1,\"b\":[2,3]}" },
+    "variables": {},
+    "code": "test('equal ok', () => { expect(response.json()).toEqual({a:1,b:[2,3]}); }); test('equal bad', () => { expect(response.json()).toEqual({a:1,b:[2,4]}); });"
+  },
+  {
+    "name": "toContain string and array",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "{\"tags\":[\"a\",\"b\"]}" },
+    "variables": {},
+    "code": "test('str contains', () => { expect(response.text()).toContain('tags'); }); test('arr contains', () => { expect(response.json().tags).toContain('a'); }); test('arr missing', () => { expect(response.json().tags).toContain('z'); }); test('bad type', () => { expect(response.json()).toContain('x'); });"
+  },
+  {
+    "name": "toMatch string-regex and RegExp",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "hello-123" },
+    "variables": {},
+    "code": "test('match str', () => { expect(response.text()).toMatch('[0-9]+'); }); test('match re', () => { expect(response.text()).toMatch(/^hello/); }); test('match fail', () => { expect(response.text()).toMatch(/^world/); });"
+  },
+  {
+    "name": "numeric comparisons",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 150, "bodyText": "" },
+    "variables": {},
+    "code": "test('fast', () => { expect(response.time).toBeLessThan(1000); }); test('too slow', () => { expect(response.time).toBeLessThan(100); }); test('positive', () => { expect(response.time).toBeGreaterThan(0); });"
+  },
+  {
+    "name": "toBeDefined",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "{\"id\":1}" },
+    "variables": {},
+    "code": "test('defined', () => { expect(response.json().id).toBeDefined(); }); test('undefined', () => { expect(response.json().missing).toBeDefined(); });"
+  },
+  {
+    "name": "header lowercase lookup",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": { "content-type": "application/json" }, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "test('ct', () => { expect(response.header('Content-Type')).toBe('application/json'); });"
+  },
+  {
+    "name": "variables get present and missing",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": { "token": "abc123" },
+    "code": "test('has token', () => { expect(variables.get('token')).toBe('abc123'); }); test('missing undefined', () => { expect(variables.get('nope')).toBe(undefined); });"
+  },
+  {
+    "name": "capture set scopes and json stringify",
+    "mode": "capture",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "{\"token\":\"xyz\",\"obj\":{\"k\":1}}" },
+    "variables": {},
+    "code": "variables.set('token', response.json().token); variables.set('g', 'gv', 'global'); variables.set('r', 'rv', 'runtime'); variables.set('blob', response.json().obj);"
+  },
+  {
+    "name": "set in validate mode throws inside test",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "test('cannot set', () => { variables.set('x', '1'); });"
+  },
+  {
+    "name": "invalid variable name",
+    "mode": "capture",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "variables.set('bad name!', '1');"
+  },
+  {
+    "name": "console log mixed args",
+    "mode": "capture",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "console.log('hello', 42, { a: 1 }, [1, 2]);"
+  },
+  {
+    "name": "fail() call",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "test('force fail', () => { fail('nope'); });"
+  },
+  {
+    "name": "test with non-function",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "test('bad', 123);"
+  },
+  {
+    "name": "top-level throw sets error",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "throw new Error('boom at top level');"
+  },
+  {
+    "name": "reference error surfaces",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "notDefinedAnywhere();"
+  },
+  {
+    "name": "Math and JSON builtins",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "{\"nums\":[3,1,2]}" },
+    "variables": {},
+    "code": "test('math', () => { expect(Math.max.apply(null, response.json().nums)).toBe(3); }); test('json', () => { expect(JSON.stringify(response.json().nums)).toBe('[3,1,2]'); });"
+  },
+  {
+    "name": "empty code no-op",
+    "mode": "validate",
+    "response": { "status": 200, "statusText": "OK", "headers": {}, "time": 10, "bodyText": "" },
+    "variables": {},
+    "code": "   "
+  }
+]

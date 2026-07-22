@@ -1,0 +1,120 @@
+# Hermes on Kubernetes — single-image deployment.
+#
+# NOTE ON SCALING: this manifest uses replicas: 1 with a ReadWriteOnce PVC
+# because the default storage is SQLite (a single file). To run multiple
+# replicas, migrate the backend to Postgres (see HOW-TO-DEPLOY.md) and switch
+# this to a stateless Deployment (no PVC) pointing at the shared DB — then
+# raise replicas and add the HPA at the bottom.
+#
+#   kubectl apply -f k8s/hermes.yaml
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: hermes-secrets
+type: Opaque
+stringData:
+  # CHANGE THESE — or create the Secret out-of-band and delete this block
+  JWT_SECRET: "change-me-to-a-long-random-string"
+  ADMIN_USER: "admin"
+  ADMIN_PASSWORD: "change-me"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hermes
+  labels: { app: hermes }
+spec:
+  replicas: 1                 # keep at 1 while on SQLite (see note above)
+  strategy:
+    type: Recreate           # avoid two pods opening the same SQLite file
+  selector:
+    matchLabels: { app: hermes }
+  template:
+    metadata:
+      labels: { app: hermes }
+    spec:
+      containers:
+        - name: hermes
+          image: hermes:latest        # push to your registry and set the ref
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 4000
+          env:
+            - name: DATA_DIR
+              value: /data
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: hermes-secrets, key: JWT_SECRET } }
+            - name: ADMIN_USER
+              valueFrom: { secretKeyRef: { name: hermes-secrets, key: ADMIN_USER } }
+            - name: ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: hermes-secrets, key: ADMIN_PASSWORD } }
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet: { path: /api/health, port: 4000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /api/health, port: 4000 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: hermes-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes
+spec:
+  selector: { app: hermes }
+  ports:
+    - port: 80
+      targetPort: 4000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hermes
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "20m"   # large Postman imports
+spec:
+  rules:
+    - host: hermes.example.com      # <-- your host
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hermes
+                port: { number: 80 }
+# --- Enable only after migrating to Postgres + stateless Deployment ---
+# ---
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: hermes
+# spec:
+#   scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: hermes }
+#   minReplicas: 2
+#   maxReplicas: 10
+#   metrics:
+#     - type: Resource
+#       resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }

@@ -1,0 +1,24 @@
+# dependencies & build output
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# data store — SQLite DB (holds ALL suites, users, runs), JWT secret, uploads.
+# Never publish: this is where imported/real test suites live.
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+jwt-secret
+
+# Postman collections / exported suites are user data — keep them out of the repo
+*.postman_collection.json
+
+# env / secrets
+.env
+.env.*
+
+# Go build artifacts
+hermes-go
+backend-go/hermes-go

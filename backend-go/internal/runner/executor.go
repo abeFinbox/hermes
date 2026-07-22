@@ -1,0 +1,717 @@
+package runner
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/textproto"
+	"net/url"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/finbox/hermes/backend-go/internal/model"
+	"github.com/finbox/hermes/backend-go/internal/store"
+	"github.com/ohler55/ojg/jp"
+	"github.com/ohler55/ojg/oj"
+)
+
+const maxStoredBody = 64 * 1024
+
+// ---------- variable resolution ----------
+
+// VarScope resolves {{variables}} with runtime > suite > global precedence,
+// mirroring the TS VarScope.
+type VarScope struct {
+	globalVars  map[string]string
+	suiteVars   map[string]string
+	runtimeVars map[string]string
+	GlobalsDirty bool
+}
+
+func NewVarScope(suite model.Suite) *VarScope {
+	vs := &VarScope{
+		globalVars:  map[string]string{},
+		suiteVars:   map[string]string{},
+		runtimeVars: map[string]string{},
+	}
+	if globals, err := store.GetGlobals(); err == nil {
+		for _, g := range globals {
+			vs.globalVars[g.Key] = g.Value
+		}
+	}
+	for _, v := range suite.Variables {
+		vs.suiteVars[v.Key] = v.Value
+	}
+	return vs
+}
+
+func (vs *VarScope) Get(key string) (string, bool) {
+	if v, ok := vs.runtimeVars[key]; ok {
+		return v, true
+	}
+	if v, ok := vs.suiteVars[key]; ok {
+		return v, true
+	}
+	if v, ok := vs.globalVars[key]; ok {
+		return v, true
+	}
+	return "", false
+}
+
+func (vs *VarScope) Set(key, value, scope string) {
+	switch scope {
+	case "global":
+		vs.globalVars[key] = value
+		_ = store.SetGlobal(key, value, false)
+		vs.GlobalsDirty = true
+	case "suite":
+		vs.suiteVars[key] = value
+		vs.runtimeVars[key] = value
+	default:
+		vs.runtimeVars[key] = value
+	}
+}
+
+var varRe = regexp.MustCompile(`\{\{\s*([^}\s]+)\s*\}\}`)
+var anyVarRe = regexp.MustCompile(`\{\{[^}]+\}\}`)
+
+func (vs *VarScope) Resolve(text string) string {
+	if text == "" {
+		return text
+	}
+	out := text
+	for i := 0; i < 5 && anyVarRe.MatchString(out); i++ {
+		out = varRe.ReplaceAllStringFunc(out, func(m string) string {
+			key := varRe.FindStringSubmatch(m)[1]
+			if v, ok := vs.Get(key); ok {
+				return v
+			}
+			return m
+		})
+	}
+	return out
+}
+
+func (vs *VarScope) UnresolvedIn(text string) []string {
+	resolved := vs.Resolve(text)
+	var out []string
+	for _, m := range varRe.FindAllStringSubmatch(resolved, -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
+// ---------- visual assertions & captures ----------
+
+// jsonPathFirst returns the first JSONPath match and whether one existed.
+func jsonPathFirst(bodyText, expression string) (interface{}, bool, error) {
+	data, err := oj.ParseString(bodyText)
+	if err != nil {
+		return nil, false, err
+	}
+	path := expression
+	if !strings.HasPrefix(path, "$") {
+		path = "$." + path
+	}
+	expr, err := jp.ParseString(path)
+	if err != nil {
+		return nil, false, err
+	}
+	results := expr.Get(data)
+	if len(results) == 0 {
+		return nil, false, nil
+	}
+	return results[0], true, nil
+}
+
+// stringifyValue mirrors `typeof v === 'string' ? v : JSON.stringify(v)`.
+func stringifyValue(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func runVisualAssertion(a model.Assertion, resp SandboxResponse) model.AssertionResult {
+	name := model.DescribeAssertion(a)
+	res := model.AssertionResult{Name: name}
+	switch a.Type {
+	case "status-equals":
+		exp := atoiOr(a.Expected, 0)
+		res.Passed = resp.Status == exp
+		if !res.Passed {
+			res.Message = fmt.Sprintf("got %d", resp.Status)
+		}
+	case "jsonpath-exists":
+		_, found, err := jsonPathFirst(resp.BodyText, a.Expression)
+		if err != nil {
+			return model.AssertionResult{Name: name, Passed: false, Message: err.Error()}
+		}
+		res.Passed = found
+		if !found {
+			res.Message = "path not found"
+		}
+	case "jsonpath-equals":
+		v, found, err := jsonPathFirst(resp.BodyText, a.Expression)
+		if err != nil {
+			return model.AssertionResult{Name: name, Passed: false, Message: err.Error()}
+		}
+		actual := ""
+		if found {
+			actual = stringifyValue(v)
+		}
+		res.Passed = found && actual == a.Expected
+		if !res.Passed {
+			res.Message = "got " + actual
+		}
+	case "header-equals":
+		actual, ok := resp.Headers[strings.ToLower(a.Expression)]
+		res.Passed = ok && actual == a.Expected
+		if !res.Passed {
+			shown := "(missing)"
+			if ok {
+				shown = actual
+			}
+			res.Message = "got " + shown
+		}
+	case "body-contains":
+		res.Passed = strings.Contains(resp.BodyText, a.Expected)
+		if !res.Passed {
+			res.Message = "text not found in body"
+		}
+	case "response-time-below":
+		limit := atoiOr(a.Expected, 0)
+		res.Passed = resp.Time < float64(limit)
+		if !res.Passed {
+			res.Message = fmt.Sprintf("took %sms", trimFloat(resp.Time))
+		}
+	default:
+		res.Passed = false
+		res.Message = "unknown assertion type " + a.Type
+	}
+	return res
+}
+
+func runVisualCapture(c model.CaptureRule, resp SandboxResponse) (string, error) {
+	switch c.Source {
+	case "status":
+		return strconv.Itoa(resp.Status), nil
+	case "header":
+		v, ok := resp.Headers[strings.ToLower(c.Expression)]
+		if !ok {
+			return "", fmt.Errorf("header %q not present", c.Expression)
+		}
+		return v, nil
+	case "body-text":
+		return resp.BodyText, nil
+	case "body-jsonpath":
+		v, found, err := jsonPathFirst(resp.BodyText, c.Expression)
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			return "", fmt.Errorf("JSONPath %q matched nothing", c.Expression)
+		}
+		return stringifyValue(v), nil
+	}
+	return "", fmt.Errorf("unknown capture source %s", c.Source)
+}
+
+// ---------- step execution ----------
+
+type ExecuteOpts struct {
+	Ctx      context.Context
+	WithCurl bool
+}
+
+var sharedClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	},
+}
+
+// ExecuteStep runs a single step: build request, send, validate, capture.
+func ExecuteStep(step model.Step, scope *VarScope, suite model.Suite, opts ExecuteOpts) model.StepResult {
+	ctx := opts.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := model.StepResult{StepID: step.ID, Name: step.Name, Status: "passed", Assertions: []model.AssertionResult{}, Captured: []model.CapturedValue{}, Logs: []string{}}
+
+	method := strings.ToUpper(step.Request.Method)
+	reqURL := scope.Resolve(strings.TrimSpace(step.Request.URL))
+	headers := map[string]string{}
+	for _, h := range step.Request.Headers {
+		if h.Enabled && h.Key != "" {
+			headers[scope.Resolve(h.Key)] = scope.Resolve(h.Value)
+		}
+	}
+
+	var params []model.KV
+	for _, p := range step.Request.Params {
+		if p.Enabled && p.Key != "" {
+			params = append(params, p)
+		}
+	}
+	if len(params) > 0 {
+		var qsParts []string
+		for _, p := range params {
+			qsParts = append(qsParts, url.QueryEscape(scope.Resolve(p.Key))+"="+url.QueryEscape(scope.Resolve(p.Value)))
+		}
+		qs := strings.Join(qsParts, "&")
+		base, existing, hasQ := strings.Cut(reqURL, "?")
+		if hasQ && existing != "" {
+			reqURL = base + "?" + existing + "&" + qs
+		} else {
+			reqURL = base + "?" + qs
+		}
+	}
+
+	switch step.Request.Auth.Type {
+	case "bearer":
+		headers["Authorization"] = "Bearer " + scope.Resolve(step.Request.Auth.Token)
+	case "basic":
+		cred := base64.StdEncoding.EncodeToString([]byte(scope.Resolve(step.Request.Auth.Username) + ":" + scope.Resolve(step.Request.Auth.Password)))
+		headers["Authorization"] = "Basic " + cred
+	}
+
+	var bodyBytes []byte
+	var bodyPreview *string
+	var multipartContentType string
+	sendsBody := step.Request.Body.Mode != "none" && method != "GET" && method != "HEAD"
+
+	if sendsBody && step.Request.Body.Mode == "form-data" {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		var summary []string
+		for _, f := range step.Request.Body.FormData {
+			if !f.Enabled || f.Key == "" {
+				continue
+			}
+			key := scope.Resolve(f.Key)
+			if f.Type == "file" {
+				path, name, mime, ok := store.ResolveStoredFile(f.FileID)
+				if !ok {
+					result.Status = "error"
+					result.Error = fmt.Sprintf("Field %q references a file that is no longer in the store (upload it again on the Files page)", key)
+					result.Request = &model.RequestSnapshot{Method: method, URL: reqURL, Headers: redact(headers)}
+					return result
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					result.Status = "error"
+					result.Error = fmt.Sprintf("Field %q file could not be read: %v", key, err)
+					return result
+				}
+				h := textproto.MIMEHeader{}
+				h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, key, name))
+				if mime != "" {
+					h.Set("Content-Type", mime)
+				}
+				part, _ := mw.CreatePart(h)
+				part.Write(data)
+				summary = append(summary, fmt.Sprintf("%s=@%s (%d bytes)", key, name, len(data)))
+			} else {
+				value := scope.Resolve(f.Value)
+				mw.WriteField(key, value)
+				summary = append(summary, fmt.Sprintf("%s=%s", key, value))
+			}
+		}
+		mw.Close()
+		bodyBytes = buf.Bytes()
+		multipartContentType = mw.FormDataContentType()
+		p := fmt.Sprintf("multipart/form-data — %d field(s): %s", len(summary), strings.Join(summary, ", "))
+		bodyPreview = &p
+	} else if sendsBody {
+		text := scope.Resolve(step.Request.Body.Content)
+		bodyBytes = []byte(text)
+		bodyPreview = &text
+		if step.Request.Body.Mode == "json" && !hasHeaderCI(headers, "content-type") {
+			headers["Content-Type"] = "application/json"
+		}
+		if step.Request.Body.Mode == "form" && !hasHeaderCI(headers, "content-type") {
+			headers["Content-Type"] = "application/x-www-form-urlencoded"
+		}
+	}
+
+	unresolved := scope.UnresolvedIn(reqURL)
+	snap := &model.RequestSnapshot{Method: method, URL: reqURL, Headers: redact(headers)}
+	if bodyPreview != nil {
+		bp := *bodyPreview
+		if len(bp) > maxStoredBody {
+			bp = bp[:maxStoredBody]
+		}
+		snap.Body = &bp
+	}
+	result.Request = snap
+	if opts.WithCurl {
+		result.Curl = buildCurl(method, reqURL, headers, step, scope)
+	}
+	if len(unresolved) > 0 {
+		var parts []string
+		for _, u := range unresolved {
+			parts = append(parts, "{{"+u+"}}")
+		}
+		result.Status = "error"
+		result.Error = "Unresolved variables in URL: " + strings.Join(parts, ", ")
+		return result
+	}
+
+	// send
+	timeout := time.Duration(suite.Settings.RequestTimeoutMs) * time.Millisecond
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var bodyReader io.Reader
+	if bodyBytes != nil {
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+	httpReq, err := http.NewRequestWithContext(reqCtx, method, reqURL, bodyReader)
+	if err != nil {
+		result.Status = "error"
+		result.Error = "Request failed: " + err.Error()
+		return result
+	}
+	for k, v := range headers {
+		httpReq.Header.Set(k, v)
+	}
+	if multipartContentType != "" {
+		httpReq.Header.Set("Content-Type", multipartContentType)
+	}
+
+	started := time.Now()
+	httpResp, err := sharedClient.Do(httpReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			// run was stopped mid-request — treat as skipped, not a real error
+			result.Status = "skipped"
+			result.Error = "Stopped"
+			return result
+		}
+		result.Status = "error"
+		result.Error = "Request failed: " + err.Error()
+		return result
+	}
+	defer httpResp.Body.Close()
+	rawBody, _ := io.ReadAll(httpResp.Body)
+	timeMs := float64(time.Since(started).Milliseconds())
+
+	respHeaders := map[string]string{}
+	for k, vals := range httpResp.Header {
+		respHeaders[strings.ToLower(k)] = strings.Join(vals, ", ")
+	}
+	resp := SandboxResponse{
+		Status:     httpResp.StatusCode,
+		StatusText: http.StatusText(httpResp.StatusCode),
+		Headers:    respHeaders,
+		Time:       timeMs,
+		BodyText:   string(rawBody),
+	}
+
+	storedBody := resp.BodyText
+	if len(storedBody) > maxStoredBody {
+		storedBody = storedBody[:maxStoredBody]
+	}
+	result.Response = &model.ResponseSnapshot{
+		Status: resp.Status, StatusText: resp.StatusText, Headers: resp.Headers,
+		TimeMs: resp.Time, Body: storedBody, BodyTruncated: len(resp.BodyText) > maxStoredBody,
+	}
+
+	// validations: visual then script
+	for _, a := range step.Validations.Visual {
+		r := runVisualAssertion(a, resp)
+		result.Assertions = append(result.Assertions, r)
+		if !r.Passed {
+			result.Status = "failed"
+		}
+	}
+	if strings.TrimSpace(step.Validations.Script) != "" {
+		out := RunScript(step.Validations.Script, resp, scope.Get, "validate")
+		result.Assertions = append(result.Assertions, out.Tests...)
+		result.Logs = append(result.Logs, out.Logs...)
+		if out.Error != "" {
+			result.Assertions = append(result.Assertions, model.AssertionResult{Name: "validation script", Passed: false, Message: out.Error})
+		}
+		if out.Failed {
+			result.Status = "failed"
+		}
+	}
+
+	// captures: run unless step failed and suite says not to
+	shouldCapture := result.Status == "passed" || suite.Settings.RunCapturesOnFailure
+	if shouldCapture {
+		for _, c := range step.Captures.Visual {
+			if c.TargetVariable == "" {
+				continue
+			}
+			value, err := runVisualCapture(c, resp)
+			if err != nil {
+				result.Assertions = append(result.Assertions, model.AssertionResult{Name: "capture " + c.TargetVariable, Passed: false, Message: err.Error()})
+				if result.Status == "passed" {
+					result.Status = "failed"
+				}
+				continue
+			}
+			scope.Set(c.TargetVariable, value, c.Scope)
+			result.Captured = append(result.Captured, model.CapturedValue{Key: c.TargetVariable, Value: value, Scope: c.Scope})
+		}
+		if strings.TrimSpace(step.Captures.Script) != "" {
+			out := RunScript(step.Captures.Script, resp, scope.Get, "capture")
+			result.Logs = append(result.Logs, out.Logs...)
+			for _, sv := range out.SetVariables {
+				scope.Set(sv.Key, sv.Value, sv.Scope)
+				result.Captured = append(result.Captured, model.CapturedValue{Key: sv.Key, Value: sv.Value, Scope: sv.Scope})
+			}
+			if out.Error != "" {
+				result.Assertions = append(result.Assertions, model.AssertionResult{Name: "capture script", Passed: false, Message: out.Error})
+				if result.Status == "passed" {
+					result.Status = "failed"
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+var redactRe = regexp.MustCompile(`(?i)authorization|api-key|x-api-key|cookie`)
+
+func redact(headers map[string]string) map[string]string {
+	out := map[string]string{}
+	for k, v := range headers {
+		if redactRe.MatchString(k) {
+			cut := v
+			if len(cut) > 12 {
+				cut = cut[:12]
+			}
+			out[k] = cut + "…(redacted)"
+		} else {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+func buildCurl(method, reqURL string, headers map[string]string, step model.Step, scope *VarScope) string {
+	q := func(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+	lines := []string{fmt.Sprintf("curl -X %s %s", method, q(reqURL))}
+	for k, v := range headers {
+		lines = append(lines, "-H "+q(k+": "+v))
+	}
+	body := step.Request.Body
+	sendsBody := body.Mode != "none" && method != "GET" && method != "HEAD"
+	if sendsBody {
+		if body.Mode == "form-data" {
+			for _, f := range body.FormData {
+				if !f.Enabled || f.Key == "" {
+					continue
+				}
+				key := scope.Resolve(f.Key)
+				if f.Type == "file" {
+					_, name, _, ok := store.ResolveStoredFile(f.FileID)
+					if !ok {
+						name = "<missing-file>"
+					}
+					lines = append(lines, "-F "+q(key+"=@"+name))
+				} else {
+					lines = append(lines, "-F "+q(key+"="+scope.Resolve(f.Value)))
+				}
+			}
+		} else {
+			lines = append(lines, "--data-raw "+q(scope.Resolve(body.Content)))
+		}
+	}
+	return strings.Join(lines, " \\\n  ")
+}
+
+// ---------- run orchestration ----------
+
+type runControl struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+var (
+	activeMu   sync.Mutex
+	activeRuns = map[string]*runControl{}
+)
+
+// StopRun requests cancellation of an in-flight run. False if not active here.
+func StopRun(runID string) bool {
+	activeMu.Lock()
+	defer activeMu.Unlock()
+	ctrl, ok := activeRuns[runID]
+	if !ok {
+		return false
+	}
+	ctrl.cancel()
+	return true
+}
+
+func nowISO() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+// StartRun persists a running Run and kicks off execution in the background.
+func StartRun(suite model.Suite, cycles int, stopOnFailure bool) model.Run {
+	run := model.Run{
+		ID: model.NewID(), SuiteID: suite.ID, SuiteName: suite.Name, Status: "running",
+		Cycles: cycles, StopOnFailure: stopOnFailure, StartedAt: nowISO(),
+		CycleResults: []model.CycleResult{}, Summary: nil,
+	}
+	persistRun(run)
+	ctx, cancel := context.WithCancel(context.Background())
+	activeMu.Lock()
+	activeRuns[run.ID] = &runControl{ctx: ctx, cancel: cancel}
+	activeMu.Unlock()
+	go executeRun(run, suite, ctx)
+	return run
+}
+
+func executeRun(run model.Run, suite model.Suite, ctx context.Context) {
+	startedMs := time.Now()
+	cancelled := func() bool { return ctx.Err() != nil }
+
+	for cycle := 1; cycle <= run.Cycles && !cancelled(); cycle++ {
+		scope := NewVarScope(suite) // fresh scope per cycle; globals persist across cycles
+		cr := model.CycleResult{Cycle: cycle, Passed: true, Steps: []model.StepResult{}}
+		run.CycleResults = append(run.CycleResults, cr)
+		idx := len(run.CycleResults) - 1
+		aborted := false
+		for _, step := range suite.Steps {
+			if !step.Enabled || aborted || cancelled() {
+				run.CycleResults[idx].Steps = append(run.CycleResults[idx].Steps, model.StepResult{
+					StepID: step.ID, Name: step.Name, Status: "skipped",
+					Assertions: []model.AssertionResult{}, Captured: []model.CapturedValue{}, Logs: []string{},
+				})
+				continue
+			}
+			sr := ExecuteStep(step, scope, suite, ExecuteOpts{Ctx: ctx})
+			run.CycleResults[idx].Steps = append(run.CycleResults[idx].Steps, sr)
+			if sr.Status != "passed" {
+				run.CycleResults[idx].Passed = false
+				if run.StopOnFailure && !cancelled() {
+					aborted = true
+				}
+			}
+			persistRun(run) // progressive persistence for live polling
+		}
+		if !run.CycleResults[idx].Passed && run.StopOnFailure && !cancelled() {
+			break
+		}
+	}
+
+	if cancelled() {
+		run.Status = "stopped"
+	} else {
+		allPassed := true
+		for _, c := range run.CycleResults {
+			if !c.Passed {
+				allPassed = false
+				break
+			}
+		}
+		if allPassed {
+			run.Status = "passed"
+		} else {
+			run.Status = "failed"
+		}
+	}
+
+	activeMu.Lock()
+	delete(activeRuns, run.ID)
+	activeMu.Unlock()
+
+	fin := nowISO()
+	run.FinishedAt = &fin
+	summary := summarize(run, float64(time.Since(startedMs).Milliseconds()))
+	run.Summary = &summary
+	persistRun(run)
+}
+
+func summarize(run model.Run, durationMs float64) model.RunSummary {
+	s := model.RunSummary{DurationMs: durationMs}
+	for _, c := range run.CycleResults {
+		for _, st := range c.Steps {
+			s.TotalSteps++
+			switch st.Status {
+			case "passed":
+				s.PassedSteps++
+			case "failed":
+				s.FailedSteps++
+			case "error":
+				s.ErroredSteps++
+			default:
+				s.SkippedSteps++
+			}
+			s.TotalAssertions += len(st.Assertions)
+			for _, a := range st.Assertions {
+				if a.Passed {
+					s.PassedAssertions++
+				}
+			}
+		}
+	}
+	return s
+}
+
+func persistRun(run model.Run) {
+	cycleJSON, _ := json.Marshal(run.CycleResults)
+	var summaryJSON interface{}
+	if run.Summary != nil {
+		b, _ := json.Marshal(run.Summary)
+		summaryJSON = string(b)
+	}
+	var finished interface{}
+	if run.FinishedAt != nil {
+		finished = *run.FinishedAt
+	}
+	stopVal := 0
+	if run.StopOnFailure {
+		stopVal = 1
+	}
+	_, _ = store.DB.Exec(
+		`INSERT INTO runs (id, suite_id, suite_name, status, cycles, stop_on_failure, started_at, finished_at, cycle_results_json, summary_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET status = excluded.status, finished_at = excluded.finished_at,
+		   cycle_results_json = excluded.cycle_results_json, summary_json = excluded.summary_json`,
+		run.ID, run.SuiteID, run.SuiteName, run.Status, run.Cycles, stopVal,
+		run.StartedAt, finished, string(cycleJSON), summaryJSON,
+	)
+}
+
+// ---------- small helpers ----------
+
+func atoiOr(s string, def int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+		return n
+	}
+	return def
+}
+
+func hasHeaderCI(headers map[string]string, name string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func trimFloat(f float64) string {
+	if f == float64(int64(f)) {
+		return strconv.FormatInt(int64(f), 10)
+	}
+	return strconv.FormatFloat(f, 'f', -1, 64)
+}
