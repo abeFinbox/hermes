@@ -1,0 +1,169 @@
+[
+  {
+    "name": "minimal-single-step",
+    "seedVars": { "BASE": "http://127.0.0.1:4651" },
+    "load": { "vus": 1, "durationSec": 10, "rps": 50, "thinkTimeMs": 0, "p95Ms": null, "errorRatePct": null },
+    "suite": {
+      "name": "Minimal",
+      "settings": { "stopOnFailure": false, "defaultCycles": 1, "runCapturesOnFailure": true, "requestTimeoutMs": 30000 },
+      "steps": [
+        {
+          "id": "step-1",
+          "name": "Health",
+          "enabled": true,
+          "request": { "method": "get", "url": "{{BASE}}/api/health" }
+        }
+      ]
+    }
+  },
+  {
+    "name": "chained-with-sandbox-scripts",
+    "seedVars": { "BASE": "http://127.0.0.1:4651", "zzz_last": "z", "aaa_first": "a" },
+    "load": { "vus": 5, "durationSec": 30, "rps": 200, "thinkTimeMs": 250, "p95Ms": 500, "errorRatePct": 1 },
+    "suite": {
+      "name": "Chained flow",
+      "settings": { "stopOnFailure": true, "defaultCycles": 3, "runCapturesOnFailure": false, "requestTimeoutMs": 45000 },
+      "steps": [
+        {
+          "id": "step-login",
+          "name": "01 Login",
+          "enabled": true,
+          "request": {
+            "method": "POST",
+            "url": "{{BASE}}/mock/login",
+            "headers": [
+              { "key": "X-Zeta", "value": "z", "enabled": true },
+              { "key": "X-Alpha", "value": "a", "enabled": true },
+              { "key": "X-Disabled", "value": "nope", "enabled": false }
+            ],
+            "body": { "mode": "json", "content": "{\"username\":\"demo\",\"password\":\"pw\"}" }
+          },
+          "validations": {
+            "visual": [{ "id": "a1", "type": "status-equals", "expected": "200" }],
+            "script": "test(\"has token\", function () { expect(response.json().token).toBeDefined(); });"
+          },
+          "captures": {
+            "visual": [],
+            "script": "variables.set(\"token\", response.json().token);"
+          }
+        },
+        {
+          "id": "step-items",
+          "name": "02 Items",
+          "enabled": true,
+          "request": {
+            "method": "GET",
+            "url": "{{BASE}}/mock/items",
+            "params": [
+              { "key": "q", "value": "a&b=c", "enabled": true },
+              { "key": "empty", "value": "", "enabled": true }
+            ],
+            "auth": { "type": "bearer", "token": "{{token}}" }
+          },
+          "validations": {
+            "visual": [
+              { "id": "a2", "type": "jsonpath-equals", "expression": "$.count", "expected": "3" },
+              { "id": "a3", "type": "header-equals", "expression": "Content-Type", "expected": "application/json; charset=utf-8" },
+              { "id": "a4", "type": "body-contains", "expected": "alpha" },
+              { "id": "a5", "type": "response-time-below", "expected": "800" },
+              { "id": "a6", "type": "jsonpath-exists", "expression": "$.items[0].name" }
+            ],
+            "script": ""
+          },
+          "captures": {
+            "visual": [
+              { "id": "c1", "source": "body-jsonpath", "expression": "$.items[0].name", "targetVariable": "firstItem", "scope": "suite" },
+              { "id": "c2", "source": "header", "expression": "Content-Type", "targetVariable": "ctype", "scope": "global" },
+              { "id": "c3", "source": "status", "expression": "", "targetVariable": "lastStatus", "scope": "runtime" }
+            ],
+            "script": ""
+          }
+        },
+        {
+          "id": "step-disabled",
+          "name": "03 Skipped",
+          "enabled": false,
+          "request": { "method": "DELETE", "url": "{{BASE}}/mock/items/1" }
+        }
+      ]
+    }
+  },
+  {
+    "name": "polling-and-basic-auth",
+    "seedVars": {},
+    "load": { "vus": 3, "durationSec": 20, "rps": 25, "thinkTimeMs": 0, "p95Ms": null, "errorRatePct": 100 },
+    "suite": {
+      "name": "Async pipeline",
+      "settings": { "stopOnFailure": false, "defaultCycles": 1, "runCapturesOnFailure": true, "requestTimeoutMs": 30000 },
+      "steps": [
+        {
+          "id": "step-start",
+          "name": "Start job",
+          "enabled": true,
+          "request": {
+            "method": "POST",
+            "url": "http://127.0.0.1:4651/mock/job",
+            "auth": { "type": "basic", "username": "u\"quote", "password": "p\\back" },
+            "body": { "mode": "form", "content": "ms=900" }
+          },
+          "captures": { "visual": [], "script": "variables.set(\"jobId\", response.json().jobId);" }
+        },
+        {
+          "id": "step-await",
+          "name": "Await job",
+          "enabled": true,
+          "request": { "method": "GET", "url": "http://127.0.0.1:4651/mock/job/{{jobId}}" },
+          "polling": {
+            "enabled": true,
+            "intervalMs": 100,
+            "timeoutMs": 8000,
+            "stopScript": "if (response.json().status === \"completed\") stop();"
+          },
+          "validations": {
+            "visual": [{ "id": "a7", "type": "jsonpath-equals", "expression": "$.status", "expected": "completed" }],
+            "script": ""
+          }
+        }
+      ]
+    }
+  },
+  {
+    "name": "form-data-with-file-and-tricky-strings",
+    "seedVars": { "note": "line1\nline2\ttabbed", "html": "<b>&amp;</b>" },
+    "load": { "vus": 2, "durationSec": 15, "rps": 10, "thinkTimeMs": 100, "p95Ms": 1500, "errorRatePct": 25 },
+    "filePaths": { "file-b": "/data/files/bbb.pdf", "file-a": "/data/files/aaa.png" },
+    "fileMeta": {
+      "file-a": { "filename": "a a.png", "mime": "image/png" },
+      "file-b": { "filename": "b\"quote.pdf", "mime": "application/pdf" }
+    },
+    "hostHeader": "api.internal.example.com",
+    "suite": {
+      "name": "Upload \"quoted\" & <tagged>",
+      "settings": { "stopOnFailure": false, "defaultCycles": 1, "runCapturesOnFailure": true, "requestTimeoutMs": 30000 },
+      "steps": [
+        {
+          "id": "step-upload",
+          "name": "Upload files",
+          "enabled": true,
+          "request": {
+            "method": "POST",
+            "url": "http://127.0.0.1:4651/mock/upload",
+            "body": {
+              "mode": "form-data",
+              "content": "",
+              "formData": [
+                { "id": "f1", "key": "note", "type": "text", "value": "{{note}}", "fileId": "", "enabled": true },
+                { "id": "f2", "key": "doc", "type": "file", "value": "", "fileId": "file-b", "enabled": true },
+                { "id": "f3", "key": "img", "type": "file", "value": "", "fileId": "file-a", "enabled": true },
+                { "id": "f4", "key": "off", "type": "text", "value": "x", "fileId": "", "enabled": false },
+                { "id": "f5", "key": "unknownfile", "type": "file", "value": "", "fileId": "missing-id", "enabled": true }
+              ]
+            }
+          },
+          "validations": { "visual": [{ "id": "a8", "type": "status-equals", "expected": "200" }], "script": "" },
+          "captures": { "visual": [], "script": "" }
+        }
+      ]
+    }
+  }
+]

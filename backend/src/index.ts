@@ -12,6 +12,7 @@ import { runsRouter } from './routes/runs.js';
 import { docsRouter } from './routes/docs.js';
 import { filesRouter } from './routes/files.js';
 import { metricsRouter } from './routes/metrics.js';
+import { heraRouter } from './routes/hera.js';
 import { mockRouter } from './mock.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,6 +22,10 @@ seedAdmin();
 
 const app = express();
 app.disable('x-powered-by');
+// Suite bundles embed file blobs as base64, so they get a larger ceiling than
+// the rest of the API. Mounted first: body-parser marks the body as read, so
+// the 20mb parser below skips this path instead of rejecting it at 20mb.
+app.use('/api/suites/import-bundle', express.json({ limit: '64mb' }));
 app.use(express.json({ limit: '20mb' })); // postman collections can be large
 app.use(cookieParser());
 
@@ -40,6 +45,7 @@ protectedApi.use('/runs', runsRouter);
 protectedApi.use('/docs', docsRouter);
 protectedApi.use('/files', filesRouter);
 protectedApi.use('/metrics', metricsRouter);
+protectedApi.use('/hera', heraRouter);
 app.use('/api', protectedApi);
 
 // demo target API for trying out suites without an external service

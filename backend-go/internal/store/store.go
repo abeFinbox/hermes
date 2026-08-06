@@ -78,6 +78,67 @@ CREATE TABLE IF NOT EXISTS runs (
   cycle_results_json TEXT NOT NULL,
   summary_json TEXT
 );
+
+-- ---- Hera (k6 load testing) ----
+-- Kept in its own tables rather than reusing the runs table: a load test has no
+-- per-step pass/fail truth, it has percentiles, throughput and error rates.
+-- Schema text is identical in backend/src/db.ts.
+CREATE TABLE IF NOT EXISTS hera_runs (
+  id TEXT PRIMARY KEY,
+  suite_id TEXT NOT NULL,
+  suite_name TEXT NOT NULL,
+  status TEXT NOT NULL,
+  config_json TEXT NOT NULL,
+  applied_config_json TEXT NOT NULL,
+  target_hosts_json TEXT NOT NULL DEFAULT '[]',
+  k6_version TEXT NOT NULL DEFAULT '',
+  backend TEXT NOT NULL DEFAULT '',
+  owner_instance TEXT NOT NULL DEFAULT '',
+  heartbeat_at TEXT,
+  exit_code INTEGER,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  summary_json TEXT,
+  samples_json TEXT NOT NULL DEFAULT '[]',
+  steps_json TEXT NOT NULL DEFAULT '[]',
+  stderr_tail TEXT NOT NULL DEFAULT '',
+  overhead_ms REAL,
+  confidence TEXT NOT NULL DEFAULT 'unknown',
+  created_by_user_id TEXT NOT NULL DEFAULT '',
+  created_by_username TEXT NOT NULL DEFAULT '',
+  created_by_role TEXT NOT NULL DEFAULT '',
+  source_ip TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_hera_runs_started ON hera_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_hera_runs_suite ON hera_runs(suite_id);
+
+-- Append-only. Deliberately has no DELETE route: an admin removing a run
+-- must not be able to erase the record of what Hera was aimed at.
+CREATE TABLE IF NOT EXISTS hera_audit (
+  id TEXT PRIMARY KEY,
+  at TEXT NOT NULL,
+  event TEXT NOT NULL,
+  run_id TEXT,
+  user_id TEXT NOT NULL DEFAULT '',
+  username TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT '',
+  source_ip TEXT NOT NULL DEFAULT '',
+  backend TEXT NOT NULL DEFAULT '',
+  suite_id TEXT NOT NULL DEFAULT '',
+  target_hosts_json TEXT NOT NULL DEFAULT '[]',
+  detail_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_hera_audit_at ON hera_audit(at DESC);
+
+-- Single-row cross-process lock. Both backends share this file, so an
+-- in-process mutex would allow one run EACH — twice the intended load.
+CREATE TABLE IF NOT EXISTS hera_lock (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  run_id TEXT,
+  owner TEXT,
+  heartbeat_at TEXT
+);
+INSERT OR IGNORE INTO hera_lock (id, run_id, owner, heartbeat_at) VALUES (1, NULL, NULL, NULL);
 `
 
 // Init opens the shared database and resolves the shared JWT secret.
@@ -116,8 +177,63 @@ func Init() error {
 	if err := ensureColumn("captcha_exempt", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := ReapStaleHeraRuns(); err != nil {
+		return err
+	}
 
 	return initSecret()
+}
+
+// InstanceID identifies this process. A Hera run records the instance that owns
+// it, so a restart can tell its own abandoned rows apart from a run that is
+// still live on the other backend against the same database file.
+var InstanceID = model.NewID()
+
+// HeraActiveStatuses are the statuses whose runs have a live k6 child, or should.
+var HeraActiveStatuses = []string{"queued", "ramping", "running", "stopping"}
+
+// HeraStaleAfter is how long a Hera row may go without a heartbeat before it is
+// considered abandoned. The runner heartbeats every 10s, so this is six misses.
+const HeraStaleAfter = 60 * time.Second
+
+// ReapStaleHeraRuns marks Hera rows abandoned by a crashed or restarted process.
+//
+// The existing suite runner leaves 'running' rows behind forever on restart —
+// Hera must not inherit that, because a stale row would also hold the hera_lock
+// and block every future run.
+//
+// Staleness is decided by heartbeat age, NOT by "is this row mine", because the
+// other backend may legitimately be running a load test against this same file
+// right now. Its heartbeat is fresh, so it survives.
+func ReapStaleHeraRuns() error {
+	now := time.Now().UTC()
+	cutoff := now.Add(-HeraStaleAfter).Format(time.RFC3339)
+	placeholders := make([]string, len(HeraActiveStatuses))
+	args := []interface{}{now.Format(time.RFC3339)}
+	for i, s := range HeraActiveStatuses {
+		placeholders[i] = "?"
+		args = append(args, s)
+	}
+	args = append(args, cutoff)
+	res, err := DB.Exec(
+		`UPDATE hera_runs SET status = 'interrupted', finished_at = ?
+		 WHERE status IN (`+strings.Join(placeholders, ", ")+`) AND (heartbeat_at IS NULL OR heartbeat_at < ?)`,
+		args...,
+	)
+	if err != nil {
+		return err
+	}
+	// Release the lock only if it is held by one of those abandoned runs.
+	if _, err := DB.Exec(
+		`UPDATE hera_lock SET run_id = NULL, owner = NULL, heartbeat_at = NULL
+		 WHERE id = 1 AND (heartbeat_at IS NULL OR heartbeat_at < ?)`, cutoff,
+	); err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		fmt.Printf("[hera] marked %d abandoned load-test run(s) as interrupted\n", n)
+	}
+	return nil
 }
 
 // ensureRoleColumn adds users.role (admin | moderator | npc), mirroring the

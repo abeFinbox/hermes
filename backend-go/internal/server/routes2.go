@@ -2,10 +2,12 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -379,7 +381,7 @@ func runStep(w http.ResponseWriter, r *http.Request) {
 	}
 	suite := model.Suite{ID: "ad-hoc", Name: "ad-hoc", Steps: []model.Step{*body.Step}, Variables: vars, Settings: settings}
 	scope := runner.NewVarScope(suite)
-	result := runner.ExecuteStep(*body.Step, scope, suite, runner.ExecuteOpts{WithCurl: true})
+	result := runner.ExecuteStep(*body.Step, scope, suite, runner.ExecuteOpts{WithCurl: true, FullBody: true})
 	web.JSON(w, 200, result)
 }
 
@@ -492,6 +494,11 @@ const mockTokenPrefix = "mock-token-"
 
 var itemSeq = 3
 
+var (
+	jobSeq  = 0
+	jobIDRe = regexp.MustCompile(`^job-(\d+)-(\d+)-\d+$`)
+)
+
 func checkBearer(r *http.Request) bool {
 	return strings.HasPrefix(r.Header.Get("Authorization"), "Bearer "+mockTokenPrefix)
 }
@@ -555,6 +562,74 @@ func mockRouter() chi.Router {
 		}
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 		web.JSON(w, 200, map[string]int{"delayedMs": ms})
+	})
+	// Async job pair — the shape real pipelines have: accept the work, then make
+	// the caller poll until it finishes. This is what makes Hera's polling
+	// support testable without an external service.
+	//
+	// Deliberately STATELESS: the completion time is encoded in the job id, so a
+	// load test creating thousands of jobs grows no server-side map and the two
+	// backends need no shared state to agree. Ids are forgeable, which is fine
+	// for a demo API with no auth.
+	//
+	//	job-<readyAtEpochMs>-<totalMs>-<seq>
+	r.Post("/job", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Ms int }
+		_ = web.Decode(r, &body)
+		ms := body.Ms
+		if ms <= 0 {
+			if v, err := strconv.Atoi(r.URL.Query().Get("ms")); err == nil {
+				ms = v
+			}
+		}
+		if ms <= 0 {
+			ms = 1500
+		}
+		if ms > 10000 {
+			ms = 10000
+		}
+		readyAt := time.Now().UnixMilli() + int64(ms)
+		jobSeq++
+		pollAfter := 500
+		if ms < pollAfter {
+			pollAfter = ms
+		}
+		web.JSON(w, 202, map[string]interface{}{
+			"jobId":       fmt.Sprintf("job-%d-%d-%d", readyAt, ms, jobSeq),
+			"status":      "pending",
+			"totalMs":     ms,
+			"pollAfterMs": pollAfter,
+		})
+	})
+	r.Get("/job/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		m := jobIDRe.FindStringSubmatch(id)
+		if m == nil {
+			web.Err(w, 404, "unknown job id")
+			return
+		}
+		readyAt, _ := strconv.ParseInt(m[1], 10, 64)
+		totalMs, _ := strconv.ParseInt(m[2], 10, 64)
+		remaining := readyAt - time.Now().UnixMilli()
+		if remaining > 0 {
+			// never reports 100 while pending, so a stop condition on progress works too
+			progress := int64(0)
+			if totalMs > 0 {
+				progress = (totalMs - remaining) * 100 / totalMs
+			}
+			if progress < 0 {
+				progress = 0
+			}
+			if progress > 99 {
+				progress = 99
+			}
+			web.JSON(w, 200, map[string]interface{}{"jobId": id, "status": "pending", "progress": progress})
+			return
+		}
+		web.JSON(w, 200, map[string]interface{}{
+			"jobId": id, "status": "completed", "progress": 100,
+			"result": map[string]interface{}{"tookMs": totalMs},
+		})
 	})
 	r.Post("/upload", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseMultipartForm(25 * 1024 * 1024)

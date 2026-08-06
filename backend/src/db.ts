@@ -17,6 +17,10 @@ export const db = new DatabaseSync(join(DATA_DIR, 'app.db'));
 
 db.exec(`
   PRAGMA journal_mode = WAL;
+  -- Wait out a write lock held by the other backend instead of failing
+  -- instantly. Matches the busy_timeout(5000) the Go backend sets in its DSN
+  -- (backend-go/internal/store/store.go); both processes share this file.
+  PRAGMA busy_timeout = 5000;
 
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -73,6 +77,67 @@ db.exec(`
     cycle_results_json TEXT NOT NULL,
     summary_json TEXT
   );
+
+  -- ---- Hera (k6 load testing) ----
+  -- Kept in its own tables rather than reusing the runs table: a load test has no
+  -- per-step pass/fail truth, it has percentiles, throughput and error rates.
+  -- Schema text is identical in backend-go/internal/store/store.go.
+  CREATE TABLE IF NOT EXISTS hera_runs (
+    id TEXT PRIMARY KEY,
+    suite_id TEXT NOT NULL,
+    suite_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    applied_config_json TEXT NOT NULL,
+    target_hosts_json TEXT NOT NULL DEFAULT '[]',
+    k6_version TEXT NOT NULL DEFAULT '',
+    backend TEXT NOT NULL DEFAULT '',
+    owner_instance TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT,
+    exit_code INTEGER,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    summary_json TEXT,
+    samples_json TEXT NOT NULL DEFAULT '[]',
+    steps_json TEXT NOT NULL DEFAULT '[]',
+    stderr_tail TEXT NOT NULL DEFAULT '',
+    overhead_ms REAL,
+    confidence TEXT NOT NULL DEFAULT 'unknown',
+    created_by_user_id TEXT NOT NULL DEFAULT '',
+    created_by_username TEXT NOT NULL DEFAULT '',
+    created_by_role TEXT NOT NULL DEFAULT '',
+    source_ip TEXT NOT NULL DEFAULT ''
+  );
+  CREATE INDEX IF NOT EXISTS idx_hera_runs_started ON hera_runs(started_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_hera_runs_suite ON hera_runs(suite_id);
+
+  -- Append-only. Deliberately has no DELETE route: an admin removing a run
+  -- must not be able to erase the record of what Hera was aimed at.
+  CREATE TABLE IF NOT EXISTS hera_audit (
+    id TEXT PRIMARY KEY,
+    at TEXT NOT NULL,
+    event TEXT NOT NULL,
+    run_id TEXT,
+    user_id TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    source_ip TEXT NOT NULL DEFAULT '',
+    backend TEXT NOT NULL DEFAULT '',
+    suite_id TEXT NOT NULL DEFAULT '',
+    target_hosts_json TEXT NOT NULL DEFAULT '[]',
+    detail_json TEXT NOT NULL DEFAULT '{}'
+  );
+  CREATE INDEX IF NOT EXISTS idx_hera_audit_at ON hera_audit(at DESC);
+
+  -- Single-row cross-process lock. Both backends share this file, so an
+  -- in-process mutex would allow one run EACH — twice the intended load.
+  CREATE TABLE IF NOT EXISTS hera_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    run_id TEXT,
+    owner TEXT,
+    heartbeat_at TEXT
+  );
+  INSERT OR IGNORE INTO hera_lock (id, run_id, owner, heartbeat_at) VALUES (1, NULL, NULL, NULL);
 `);
 
 // --- Migration: users.role (admin | moderator | npc) ---
@@ -99,6 +164,51 @@ function ensureCaptchaExemptColumn() {
 ensureCaptchaExemptColumn();
 
 export type Role = 'admin' | 'moderator' | 'npc';
+
+// This process's identity. A Hera run records the instance that owns it, so a
+// restart can tell its own abandoned rows apart from a run that is still live
+// on the other backend against the same database file.
+export const INSTANCE_ID: string = crypto.randomUUID();
+
+/** Active Hera statuses — a run in any of these has a live k6 child, or should. */
+export const HERA_ACTIVE_STATUSES = ['queued', 'ramping', 'running', 'stopping'] as const;
+
+// How long a Hera row may go without a heartbeat before it is considered
+// abandoned. The runner heartbeats every 10s, so 60s is six missed beats.
+export const HERA_STALE_MS = 60_000;
+
+/**
+ * Reap Hera rows abandoned by a crashed or restarted process.
+ *
+ * The existing suite runner leaves 'running' rows behind forever on restart
+ * (see the note in runner/executor.ts) — Hera must not inherit that, because a
+ * stale row would also hold the hera_lock and block every future run.
+ *
+ * Staleness is decided by heartbeat age, NOT by "is this row mine", because the
+ * other backend may legitimately be running a load test against this same file
+ * right now. Its heartbeat is fresh, so it survives.
+ */
+export function reapStaleHeraRuns(): number {
+  const now = new Date();
+  const cutoff = new Date(now.getTime() - HERA_STALE_MS).toISOString();
+  const placeholders = HERA_ACTIVE_STATUSES.map(() => '?').join(', ');
+  const res = db
+    .prepare(
+      `UPDATE hera_runs SET status = 'interrupted', finished_at = ?
+       WHERE status IN (${placeholders}) AND (heartbeat_at IS NULL OR heartbeat_at < ?)`,
+    )
+    .run(now.toISOString(), ...HERA_ACTIVE_STATUSES, cutoff);
+  // Release the lock only if it is held by one of those abandoned runs.
+  db.prepare(
+    `UPDATE hera_lock SET run_id = NULL, owner = NULL, heartbeat_at = NULL
+     WHERE id = 1 AND (heartbeat_at IS NULL OR heartbeat_at < ?)`,
+  ).run(cutoff);
+  const n = Number(res.changes || 0);
+  if (n > 0) console.log(`[hera] marked ${n} abandoned load-test run(s) as interrupted`);
+  return n;
+}
+// Run at startup, mirroring store.Init() in the Go backend.
+reapStaleHeraRuns();
 
 // --- JWT secret: generated once, persisted so restarts keep sessions ---
 const secretFile = join(DATA_DIR, 'jwt-secret');

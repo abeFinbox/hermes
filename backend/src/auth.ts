@@ -74,11 +74,18 @@ export function enforcePermissions(req: AuthedRequest, res: Response, next: Next
     return next();
   }
 
-  // suite/run execution — allowed for all roles
+  // suite/run execution — allowed for all roles.
+  //
+  // NOTE ON HERA: only the STOP route is listed. Stopping is a safety action, so
+  // every role including read-only npc must be able to hit the brakes. Starting
+  // a load test is deliberately NOT here — it is gated to admin (or moderator
+  // with HERA_ALLOW_MODERATOR=1) inside routes/hera.ts. Do not "fix" this by
+  // pattern-matching the /runs entries above.
   const isExecute =
     (p === '/runs' && m === 'POST') ||
     (p === '/runs/step' && m === 'POST') ||
-    (/^\/runs\/[^/]+\/(stop|report)$/.test(p) && m === 'POST');
+    (/^\/runs\/[^/]+\/(stop|report)$/.test(p) && m === 'POST') ||
+    (/^\/hera\/[^/]+\/stop$/.test(p) && m === 'POST');
   if (isExecute) return next();
 
   if (m === 'DELETE') {

@@ -6,6 +6,7 @@ package server
 import (
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/finbox/hermes/backend-go/internal/auth"
+	"github.com/finbox/hermes/backend-go/internal/bundle"
 	"github.com/finbox/hermes/backend-go/internal/model"
 	"github.com/finbox/hermes/backend-go/internal/postman"
 	"github.com/finbox/hermes/backend-go/internal/store"
@@ -44,6 +46,7 @@ func New() http.Handler {
 		r.Mount("/api/docs", docsRouter())
 		r.Mount("/api/files", filesRouter())
 		r.Mount("/api/metrics", metricsRouter())
+		r.Mount("/api/hera", heraRouter())
 	})
 
 	r.Mount("/mock", mockRouter())
@@ -185,6 +188,9 @@ func suitesRouter() chi.Router {
 	r.Post("/", createSuite)
 	r.Get("/{id}", getSuiteHandler)
 	r.Put("/{id}", updateSuite)
+	// declared before the /{id} routes so "import-bundle" is never read as an id
+	r.Post("/import-bundle", importSuiteBundle)
+	r.Get("/{id}/bundle", exportSuiteBundle)
 	r.Get("/{id}/export", exportSuite)
 	r.Post("/{id}/duplicate", duplicateSuite)
 	r.Delete("/{id}", deleteSuite)
@@ -359,6 +365,92 @@ func updateSuite(w http.ResponseWriter, r *http.Request) {
 	}
 	s, _ := getSuite(id)
 	web.JSON(w, 200, s)
+}
+
+// exportSuiteBundle serves a native bundle — lossless, unlike exportSuite
+// below (which cannot carry polling, settings, sandbox scripts or file bytes).
+func exportSuiteBundle(w http.ResponseWriter, r *http.Request) {
+	s, _ := getSuite(chi.URLParam(r, "id"))
+	if s == nil {
+		web.Err(w, 404, "Suite not found")
+		return
+	}
+	includeFiles := r.URL.Query().Get("includeFiles") != "0"
+	wantsSecrets := r.URL.Query().Get("includeSecrets") == "1"
+	// plaintext secrets leave the instance in a downloadable file — admin only,
+	// even though GET is otherwise readable by every role
+	if wantsSecrets {
+		u := auth.UserFrom(r)
+		if u == nil || u.Role != "admin" {
+			web.Err(w, 403, "Only an admin can export secret values")
+			return
+		}
+	}
+
+	b, warnings, err := bundle.Build(*s, bundle.BuildOptions{IncludeFiles: includeFiles, IncludeSecrets: wantsSecrets})
+	if err != nil {
+		web.Err(w, 500, err.Error())
+		return
+	}
+	if r.URL.Query().Get("download") == "0" {
+		web.JSON(w, 200, map[string]interface{}{"bundle": b, "warnings": warnings})
+		return
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="`+sanitizeFilename(s.Name)+`.hermes-bundle.json"`)
+	if len(warnings) > 0 {
+		if raw, err := json.Marshal(warnings); err == nil {
+			w.Header().Set("X-Hermes-Bundle-Warnings", string(raw))
+		}
+	}
+	web.JSON(w, 200, b)
+}
+
+// importSuiteBundle accepts { bundle, name?, includeGlobals?, overwriteGlobals? }.
+func importSuiteBundle(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Bundle           json.RawMessage `json:"bundle"`
+		Name             string          `json:"name"`
+		IncludeGlobals   *bool           `json:"includeGlobals"`
+		OverwriteGlobals *bool           `json:"overwriteGlobals"`
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		web.Err(w, 400, "Could not read request body")
+		return
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		web.Err(w, 400, "Invalid JSON: "+err.Error())
+		return
+	}
+	payload := body.Bundle
+	if len(payload) == 0 {
+		payload = raw // allow posting a bare bundle
+	}
+
+	b, err := bundle.Parse(payload)
+	if err != nil {
+		if bundle.IsBadBundle(err) {
+			web.Err(w, 400, err.Error())
+		} else {
+			web.Err(w, 400, "Could not read bundle: "+err.Error())
+		}
+		return
+	}
+
+	opts := bundle.ImportOptions{Name: body.Name, IncludeGlobals: true}
+	if body.IncludeGlobals != nil {
+		opts.IncludeGlobals = *body.IncludeGlobals
+	}
+	if body.OverwriteGlobals != nil {
+		opts.OverwriteGlobals = *body.OverwriteGlobals
+	}
+
+	result, err := bundle.Import(b, opts)
+	if err != nil {
+		web.Err(w, 500, "Import failed: "+err.Error())
+		return
+	}
+	web.JSON(w, 201, result)
 }
 
 func exportSuite(w http.ResponseWriter, r *http.Request) {

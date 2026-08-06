@@ -179,6 +179,7 @@ func requireAdmin(next http.Handler) http.Handler {
 //   - DELETE is admin-only; other writes need admin or moderator.
 func EnforcePermissions(next http.Handler) http.Handler {
 	execRe := regexp.MustCompile(`^/api/runs/[^/]+/(stop|report)$`)
+	heraStopRe := regexp.MustCompile(`^/api/hera/[^/]+/stop$`)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u := UserFrom(r)
 		if u == nil {
@@ -196,9 +197,16 @@ func EnforcePermissions(next http.Handler) http.Handler {
 			return
 		}
 
+		// NOTE ON HERA: only the STOP route is listed. Stopping is a safety
+		// action, so every role including read-only npc must be able to hit the
+		// brakes. Starting a load test is deliberately NOT here — it is gated to
+		// admin (or moderator with HERA_ALLOW_MODERATOR=1) inside
+		// server/hera_routes.go. Do not "fix" this by pattern-matching the
+		// /api/runs entries above.
 		isExecute := (p == "/api/runs" && m == http.MethodPost) ||
 			(p == "/api/runs/step" && m == http.MethodPost) ||
-			(execRe.MatchString(p) && m == http.MethodPost)
+			(execRe.MatchString(p) && m == http.MethodPost) ||
+			(heraStopRe.MatchString(p) && m == http.MethodPost)
 		if isExecute {
 			next.ServeHTTP(w, r)
 			return
