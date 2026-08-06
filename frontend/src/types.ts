@@ -30,7 +30,7 @@ export interface StepRequest {
   url: string;
   headers: KV[];
   params: KV[];
-  body: { mode: BodyMode; content: string; formData?: FormDataField[] };
+  body: { mode: BodyMode; content: string; formData?: FormDataField[]; sendWithGet?: boolean };
   auth:
     | { type: 'none' }
     | { type: 'bearer'; token: string }
@@ -62,6 +62,13 @@ export interface CaptureRule {
   scope: 'suite' | 'global';
 }
 
+export interface StepPolling {
+  enabled: boolean;
+  intervalMs: number;
+  timeoutMs: number;
+  stopScript: string;
+}
+
 export interface Step {
   id: string;
   name: string;
@@ -70,8 +77,13 @@ export interface Step {
   request: StepRequest;
   validations: { visual: Assertion[]; script: string };
   captures: { visual: CaptureRule[]; script: string };
+  polling?: StepPolling;
   postmanEvents?: unknown[];
   sourceRequest?: StepRequest;
+}
+
+export function defaultPolling(): StepPolling {
+  return { enabled: false, intervalMs: 2000, timeoutMs: 30000, stopScript: '' };
 }
 
 export interface SuiteVariable {
@@ -109,6 +121,18 @@ export interface SuiteListItem {
   updatedAt: string;
 }
 
+// Result of POST /api/suites/import-bundle — a native bundle import.
+export interface BundleImportResult {
+  suiteId: string;
+  name: string;
+  stepCount: number;
+  fileMap: Record<string, string>;
+  importedGlobals: string[];
+  skippedGlobals: string[];
+  secretsNeeded: string[];
+  warnings: string[];
+}
+
 export interface GlobalVariable {
   key: string;
   value: string;
@@ -142,6 +166,16 @@ export interface CapturedValue {
   scope: 'suite' | 'global' | 'runtime';
 }
 
+export interface PollAttempt {
+  attempt: number;
+  status: number;
+  statusText: string;
+  timeMs: number;
+  body: string;
+  bodyTruncated: boolean;
+  stopped: boolean;
+}
+
 export interface StepResult {
   stepId: string;
   name: string;
@@ -151,6 +185,7 @@ export interface StepResult {
   assertions: AssertionResult[];
   captured: CapturedValue[];
   logs: string[];
+  pollAttempts?: PollAttempt[];
   error?: string;
   curl?: string;
 }
@@ -200,20 +235,24 @@ export function newId(): string {
   return crypto.randomUUID();
 }
 
+export function emptyRequest(): StepRequest {
+  return {
+    method: 'GET',
+    url: '',
+    headers: [],
+    params: [],
+    body: { mode: 'none', content: '' },
+    auth: { type: 'none' },
+  };
+}
+
 export function emptyStep(name = 'New request'): Step {
   return {
     id: newId(),
     name,
     enabled: true,
     folderPath: '',
-    request: {
-      method: 'GET',
-      url: '',
-      headers: [],
-      params: [],
-      body: { mode: 'none', content: '' },
-      auth: { type: 'none' },
-    },
+    request: emptyRequest(),
     validations: { visual: [], script: '' },
     captures: { visual: [], script: '' },
   };

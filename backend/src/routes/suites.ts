@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { db } from '../db.js';
 import { newId, defaultSettings, emptyStep, type Suite } from '../types.js';
 import { exportSuiteAsCollection } from '../postman-export.js';
+import { BundleError, buildBundle, importBundle, parseBundle } from '../suite-bundle.js';
+import type { AuthedRequest } from '../auth.js';
 
 export const suitesRouter = Router();
 
@@ -74,6 +76,47 @@ suitesRouter.put('/:id', (req, res) => {
     req.params.id,
   );
   res.json(getSuite(req.params.id));
+});
+
+// Import a native bundle: { bundle, name?, includeGlobals?, overwriteGlobals? }.
+// Declared before the /:id routes so "import-bundle" is never read as an id.
+suitesRouter.post('/import-bundle', (req, res) => {
+  const { bundle, name, includeGlobals, overwriteGlobals } = req.body || {};
+  let parsed;
+  try {
+    parsed = parseBundle(bundle ?? req.body);
+  } catch (e: any) {
+    const msg = e instanceof BundleError ? e.message : `Could not read bundle: ${e.message}`;
+    return res.status(400).json({ error: msg });
+  }
+  try {
+    const result = importBundle(parsed, { name, includeGlobals, overwriteGlobals });
+    res.status(201).json(result);
+  } catch (e: any) {
+    res.status(500).json({ error: `Import failed: ${e.message}` });
+  }
+});
+
+// Export a suite as a native bundle — lossless, unlike the Postman export
+// below (which cannot carry polling, settings, sandbox scripts or file bytes).
+suitesRouter.get('/:id/bundle', (req: AuthedRequest, res) => {
+  const suite = getSuite(req.params.id);
+  if (!suite) return res.status(404).json({ error: 'Suite not found' });
+
+  const includeFiles = req.query.includeFiles !== '0';
+  const wantsSecrets = req.query.includeSecrets === '1';
+  // plaintext secrets leave the instance in a downloadable file — admin only,
+  // even though GET is otherwise readable by every role
+  if (wantsSecrets && req.user?.role !== 'admin') {
+    return res.status(403).json({ error: 'Only an admin can export secret values' });
+  }
+
+  const { bundle, warnings } = buildBundle(suite, { includeFiles, includeSecrets: wantsSecrets });
+  const safeName = suite.name.replace(/[^\w.-]+/g, '-');
+  if (req.query.download === '0') return res.json({ bundle, warnings });
+  res.setHeader('Content-Disposition', `attachment; filename="${safeName}.hermes-bundle.json"`);
+  if (warnings.length) res.setHeader('X-Hermes-Bundle-Warnings', JSON.stringify(warnings));
+  res.json(bundle);
 });
 
 // Export a suite as a Postman collection v2.1 (re-importable here or in Postman)

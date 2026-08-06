@@ -19,11 +19,12 @@ Everything in the app, explained in the order you'll meet it. For setup and arch
 9. [Run history & reports](#9-run-history--reports)
 10. [The suite composer](#10-the-suite-composer)
 11. [Exporting to Postman](#11-exporting-to-postman)
-12. [Appearance & themes](#12-appearance--themes)
-13. [Settings, users & security](#13-settings-users--security)
-14. [Script API reference](#14-script-api-reference)
-15. [Troubleshooting](#15-troubleshooting)
-16. [Backend engine (Node ⇄ Go)](#16-backend-engine-node--go)
+12. [Migrating suites between instances](#12-migrating-suites-between-instances)
+13. [Appearance & themes](#13-appearance--themes)
+14. [Settings, users & security](#14-settings-users--security)
+15. [Script API reference](#15-script-api-reference)
+16. [Troubleshooting](#16-troubleshooting)
+17. [Backend engine (Node ⇄ Go)](#17-backend-engine-node--go)
 
 ---
 
@@ -165,7 +166,7 @@ test("fast enough", () => {
 });
 ```
 
-Each `test()` becomes its own pass/fail line in run results and reports. Full API in [§14](#14-script-api-reference).
+Each `test()` becomes its own pass/fail line in run results and reports. Full API in [§15](#15-script-api-reference).
 
 ## 8. Running: single step, whole suite, cycles
 
@@ -215,7 +216,43 @@ Included: folder structure, requests (method/URL/params/headers/body/auth), suit
 
 The export reflects the suite's **current edited state**, so it's also the way to hand your improvements back to Postman users.
 
-## 12. Appearance & themes
+> Moving a suite to **another Hermes instance** (your laptop → the Docker stack → prod)? Use a bundle instead — see §12. The Postman format cannot carry polling, suite settings, sandbox scripts or attached file bytes.
+
+## 12. Migrating suites between instances
+
+**Suites → Migrate** downloads a **Hermes bundle** (`<name>.hermes-bundle.json`) — a lossless snapshot of one suite. **Suites → Import bundle** loads it on the target instance. Both work on either backend engine, and a bundle from one engine imports into the other.
+
+Use this whenever the suite must arrive *runnable*: the bundle keeps everything the Postman format drops.
+
+| | Postman export | Hermes bundle |
+|---|---|---|
+| Requests, headers, auth, folders | ✅ | ✅ |
+| Visual assertions & captures | translated to `pm` script | ✅ kept as-is, still editable |
+| Sandbox scripts | comments only | ✅ still executed |
+| Polling (interval / timeout / stop script) | ❌ | ✅ |
+| Suite settings (cycles, stop-on-failure, timeout) | ❌ | ✅ |
+| Attached files (form-data file parts) | placeholder, no bytes | ✅ bytes embedded, re-uploaded on import |
+| Referenced global variables | ❌ | ✅ (the ones this suite uses) |
+| Opens in Postman | ✅ | ❌ Hermes only |
+
+**Migrating, step by step**
+
+1. On the source instance: **Suites → Migrate** on the row you want. Leave *Embed attached files* on unless the target already has them.
+2. Save the `.json` it downloads.
+3. On the target instance: **Suites → Import bundle** → pick the file → **Import bundle**.
+4. The result panel lists anything that needs attention. **Open suite & run** takes you straight to the editor.
+
+**What import does — and does not — touch**
+
+- It always creates a **new** suite; nothing existing is overwritten. A name clash becomes `My suite (imported)`.
+- Attached files are re-uploaded into the target's own file store and every form-data part is repointed at the new file ids — so a migrated suite never references files that only exist on the source machine.
+- Global variables the suite references come along. Values already present on the target are **kept** unless you tick *Overwrite globals that already exist here*.
+
+**Secrets are not in the bundle by default.** Secret values export blank, and both the bundle and the import result list which keys need filling in on the target. An admin can tick *Include secret values in plaintext* — that writes real credentials into a file on disk, so treat it like one. Non-admins cannot enable it at all (the server rejects the request, not just the checkbox).
+
+Two other things worth knowing: files are embedded as base64, so a suite with large attachments makes a large bundle (you get a warning past ~20 MB). And a bundle from a newer Hermes is refused outright rather than half-imported — upgrade the target first.
+
+## 13. Appearance & themes
 
 Quick-switch from the **top-bar dropdown**, or manage everything on the **Appearance** page.
 
@@ -224,7 +261,7 @@ Quick-switch from the **top-bar dropdown**, or manage everything on the **Appear
 - **Custom themes**: click **customize** on any preset → the builder opens with a color picker + hex field for each of the 12 design tokens, a corner-radius slider, and a dark flag. **Every change previews live across the whole app**; *Cancel* reverts, *Save & apply* persists.
 - Custom themes live in your **browser** (localStorage). Use **export** / **⬆ Import theme JSON** to move them between machines or share with teammates.
 
-## 13. Settings, users & security
+## 14. Settings, users & security
 
 - **Change password** — for your own account (min 6 chars).
 - **Backend engine** — pick which backend serves your requests, **Node** or **Go** (admin only; see §16). Everyone else sees the current selection read-only.
@@ -248,7 +285,7 @@ Every user has one of three roles. The backend enforces them; the UI hides contr
 
 NPCs are "look and run": they can browse suites and execute runs, but can't change anything. Moderators can build and edit but never delete.
 
-## 14. Script API reference
+## 15. Script API reference
 
 Scripts run **server-side** in a sandbox: 2-second timeout, no filesystem, no network, no `require`. Available globals: `response`, `variables`, `test`, `expect`, `fail`, `console.log`, `JSON`, `Math`.
 
@@ -282,7 +319,7 @@ Non-string values are stored JSON-stringified. Validation scripts can read but n
 
 `fail(message)` aborts the script and fails the step. `console.log(...)` output appears under **Script logs** in run results.
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
@@ -299,7 +336,7 @@ Non-string values are stored JSON-stringified. Validation scripts can read but n
 | I deleted a collection — are its suites broken? | No. Suites own a full copy of their steps; only the "reset to imported original" reference point is unaffected either way. |
 | A button I expected is missing | Your role may not permit that action (see §13 Roles). Moderators can't delete; NPCs are read-only + execute. |
 
-## 16. Backend engine (Node ⇄ Go)
+## 17. Backend engine (Node ⇄ Go)
 
 Hermes runs on either of two interchangeable backends that serve the exact same API:
 
