@@ -2,18 +2,22 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api } from '../api';
 import { Info } from '../legends';
-import { useToast, Confirm } from '../ui';
+import { useToast, Confirm, Modal } from '../ui';
 import { useAuth } from '../App';
 import { permsFor } from '../perms';
-import { emptyStep, type GlobalVariable, type Step, type StepResult, type Suite } from '../types';
-import { RequestTab, ValidateTab, CaptureTab } from '../components/StepTabs';
+import { parseCurl } from '../curl';
+import { emptyStep, type GlobalVariable, type Step, type StepRequest, type StepResult, type Suite } from '../types';
+import { RequestTab, ValidateTab, CaptureTab, PollTab } from '../components/StepTabs';
+import PollAttempts from '../components/PollAttempts';
+import BodyViewer from '../components/BodyViewer';
+import CurlBlock from '../components/CurlBlock';
 import KVEditor from '../components/KVEditor';
 import {
   ComposerBox, loadComposerItems, saveComposerItems, loadComposerOn, saveComposerOn,
   makeComposerItem, type ComposerItem,
 } from '../components/Composer';
 
-type StepTab = 'request' | 'validate' | 'capture';
+type StepTab = 'request' | 'validate' | 'capture' | 'poll';
 type SuiteTab = 'steps' | 'variables' | 'settings';
 
 export default function SuiteEditor() {
@@ -30,6 +34,7 @@ export default function SuiteEditor() {
   const [suiteTab, setSuiteTab] = useState<SuiteTab>('steps');
   const [dirty, setDirty] = useState(false);
   const [deletingStep, setDeletingStep] = useState<number | null>(null);
+  const [importCurl, setImportCurl] = useState(false);
   const [cycles, setCycles] = useState(1);
   const [stopOnFailure, setStopOnFailure] = useState(false);
   const [running, setRunning] = useState(false);
@@ -105,6 +110,17 @@ export default function SuiteEditor() {
     patchSuite({ steps });
     setSelected(steps.length - 1);
     setStepTab('request');
+  };
+
+  const addStepFromCurl = (request: StepRequest, name: string) => {
+    const step = emptyStep(name);
+    step.request = request;
+    const steps = [...suite.steps, step];
+    patchSuite({ steps });
+    setSelected(steps.length - 1);
+    setStepTab('request');
+    setImportCurl(false);
+    toast(`Added step "${name}" from cURL`);
   };
 
   const duplicateStep = (i: number) => {
@@ -328,7 +344,12 @@ export default function SuiteEditor() {
               </div>
               );
             })}
-            {perms.canCreate && <button className="btn" style={{ width: '100%' }} onClick={addStep}>+ Add step</button>}
+            {perms.canCreate && (
+              <div className="row" style={{ gap: 6 }}>
+                <button className="btn grow" onClick={addStep}>+ Add step</button>
+                <button className="btn" onClick={() => setImportCurl(true)} title="Create a step by pasting a cURL command">Import cURL</button>
+              </div>
+            )}
             <p className="muted" style={{ fontSize: 11 }}>
               Steps run top to bottom — captures from earlier steps feed later ones.
               <Info k="step.reorder" />
@@ -367,6 +388,10 @@ export default function SuiteEditor() {
                     Capture<span className="count">({step.captures.visual.length + (step.captures.script.trim() ? 1 : 0)})</span>
                     <Info k="step.capture" />
                   </button>
+                  <button className={stepTab === 'poll' ? 'active' : ''} onClick={() => setStepTab('poll')}
+                    title="Re-send this request on an interval until a stop condition is met">
+                    Poll{step.polling?.enabled && <span className="count" style={{ color: 'var(--success)' }}>on</span>}
+                  </button>
                 </div>
 
                 {/* fieldset disabled makes every editing control inside read-only for
@@ -382,6 +407,10 @@ export default function SuiteEditor() {
                   )}
                   {stepTab === 'capture' && (
                     <CaptureTab step={step} stepIndex={selected} steps={suite.steps} suiteVars={suite.variables}
+                      globals={globals} onChange={(p) => patchStep(selected, p)} onGlobalsChanged={loadGlobals} />
+                  )}
+                  {stepTab === 'poll' && (
+                    <PollTab step={step} stepIndex={selected} steps={suite.steps} suiteVars={suite.variables}
                       globals={globals} onChange={(p) => patchStep(selected, p)} onGlobalsChanged={loadGlobals} />
                   )}
                 </fieldset>
@@ -418,7 +447,40 @@ export default function SuiteEditor() {
           onNo={() => setDeletingStep(null)}
         />
       )}
+      {importCurl && <CurlImportModal onClose={() => setImportCurl(false)} onImport={addStepFromCurl} />}
     </div>
+  );
+}
+
+/** Paste a cURL command → parse it into a new request step. */
+function CurlImportModal({ onClose, onImport }: { onClose: () => void; onImport: (req: StepRequest, name: string) => void }) {
+  const [text, setText] = useState('');
+  const [error, setError] = useState('');
+
+  const doImport = () => {
+    setError('');
+    try {
+      const { request, name } = parseCurl(text);
+      onImport(request, name);
+    } catch (e: any) {
+      setError(e?.message || 'Could not parse that cURL command.');
+    }
+  };
+
+  return (
+    <Modal title="Import cURL" onClose={onClose}>
+      <p className="muted">
+        Paste a cURL command (e.g. a browser's <b>Copy as cURL</b>, or one exported from a Hermes step). It becomes a new
+        step — method, URL, headers, body and basic auth are mapped. <span className="mono">{'{{variables}}'}</span> are kept as-is.
+      </p>
+      <textarea className="code" rows={10} autoFocus placeholder={"curl 'https://api.example.com/login' \\\n  -H 'Content-Type: application/json' \\\n  --data-raw '{\"user\":\"ada\"}'"}
+        value={text} onChange={(e) => setText(e.target.value)} />
+      {error && <div className="error-text mt">{error}</div>}
+      <div className="row mt" style={{ justifyContent: 'flex-end' }}>
+        <button className="btn" onClick={onClose}>Cancel</button>
+        <button className="btn primary" disabled={!text.trim()} onClick={doImport}>Add step</button>
+      </div>
+    </Modal>
   );
 }
 
@@ -471,44 +533,16 @@ function StepRunResult({ result, onDismiss }: { result: StepResult; onDismiss: (
         </div>
       )}
 
+      {result.pollAttempts && <PollAttempts attempts={result.pollAttempts} />}
+
       {result.response && (
         <div>
-          <h3>Body {result.response.bodyTruncated && <span className="muted">(truncated)</span>}</h3>
-          <pre className="body-view">{prettyBody(result.response.body)}</pre>
+          <h3>{result.pollAttempts ? 'Final response' : 'Body'}</h3>
+          <BodyViewer body={result.response.body} truncated={result.response.bodyTruncated} />
         </div>
       )}
     </div>
   );
 }
 
-function prettyBody(text: string): string {
-  try {
-    return JSON.stringify(JSON.parse(text), null, 2);
-  } catch {
-    return text;
-  }
-}
-
 /** Copyable cURL of the exact request sent — for debugging outside the app. */
-function CurlBlock({ curl }: { curl: string }) {
-  const [copied, setCopied] = useState(false);
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(curl);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      /* clipboard blocked (e.g. insecure context) — the text is still selectable below */
-    }
-  };
-  return (
-    <div className="mb">
-      <div className="row">
-        <h3 className="grow" style={{ margin: 0 }}>cURL<Info k="step.curl" /></h3>
-        <button className="btn small" onClick={() => void copy()}>{copied ? '✓ Copied' : '⧉ Copy'}</button>
-      </div>
-      <pre className="body-view curl-view">{curl}</pre>
-      <p className="muted" style={{ fontSize: 11 }}>Real resolved values, including any secrets — for local debugging only.</p>
-    </div>
-  );
-}

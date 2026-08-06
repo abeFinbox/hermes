@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
-import type { Assertion, AssertionType, CaptureRule, FormDataField, GlobalVariable, Step, StoredFile, SuiteVariable } from '../types';
-import { newId } from '../types';
+import type { Assertion, AssertionType, CaptureRule, FormDataField, GlobalVariable, Step, StepPolling, StoredFile, SuiteVariable } from '../types';
+import { newId, defaultPolling } from '../types';
 import { api } from '../api';
 import { Info } from '../legends';
 import { formatBytes } from '../pages/Files';
@@ -58,6 +58,13 @@ export function RequestTab({ step, stepIndex, steps, suiteVars, globals, onChang
         {req.body.mode === 'form' && <span className="muted">key=value&key2=value2</span>}
         {req.body.mode === 'form-data' && <span className="muted">multipart — text fields + file uploads</span>}
       </div>
+      {req.body.mode !== 'none' && (req.method === 'GET' || req.method === 'HEAD') && (
+        <label className="row mb" style={{ gap: 6 }}>
+          <input type="checkbox" checked={!!req.body.sendWithGet}
+            onChange={(e) => setReq({ body: { ...req.body, sendWithGet: e.target.checked } })} />
+          <span className="muted">Send this body with the {req.method} request (unusual, but some APIs require it)</span>
+        </label>
+      )}
       {(req.body.mode === 'json' || req.body.mode === 'raw' || req.body.mode === 'form') && (
         <textarea className="code" rows={8} value={req.body.content} onChange={(e) => setReq({ body: { ...req.body, content: e.target.value } })} />
       )}
@@ -120,25 +127,34 @@ function FormDataEditor({ fields, onChange }: { fields: FormDataField[]; onChang
   return (
     <div>
       {fields.map((f, i) => {
-        const missing = f.type === 'file' && f.fileId && !files.some((s) => s.id === f.fileId);
+        const missing = f.type === 'file' && !!f.fileId && !files.some((s) => s.id === f.fileId);
+        // an enabled file field with no valid store file will fail on send
+        const needsFile = f.type === 'file' && f.enabled && (!f.fileId || missing);
         return (
-          <div className="row mb" key={f.id}>
-            <input type="checkbox" checked={f.enabled} title="include this field" onChange={(e) => update(i, { enabled: e.target.checked })} />
-            <input style={{ width: 170 }} type="text" placeholder="field name" value={f.key} onChange={(e) => update(i, { key: e.target.value })} />
-            <select style={{ width: 90 }} value={f.type} onChange={(e) => update(i, { type: e.target.value as 'text' | 'file' })}>
-              <option value="text">text</option>
-              <option value="file">file</option>
-            </select>
-            {f.type === 'text' ? (
-              <input className="grow mono" type="text" placeholder="value or {{var}}" value={f.value} onChange={(e) => update(i, { value: e.target.value })} />
-            ) : (
-              <select className="grow mono" value={f.fileId} onChange={(e) => update(i, { fileId: e.target.value })} style={missing ? { borderColor: 'var(--danger)' } : undefined}>
-                <option value="">— choose a file —</option>
-                {missing && <option value={f.fileId}>⚠ missing (deleted) file</option>}
-                {files.map((s) => <option key={s.id} value={s.id}>{s.originalName} ({formatBytes(s.size)})</option>)}
+          <div key={f.id}>
+            <div className="row mb" style={{ marginBottom: needsFile ? 2 : undefined }}>
+              <input type="checkbox" checked={f.enabled} title="include this field" onChange={(e) => update(i, { enabled: e.target.checked })} />
+              <input style={{ width: 170 }} type="text" placeholder="field name" value={f.key} onChange={(e) => update(i, { key: e.target.value })} />
+              <select style={{ width: 90 }} value={f.type} onChange={(e) => update(i, { type: e.target.value as 'text' | 'file' })}>
+                <option value="text">text</option>
+                <option value="file">file</option>
               </select>
+              {f.type === 'text' ? (
+                <input className="grow mono" type="text" placeholder="value or {{var}}" value={f.value} onChange={(e) => update(i, { value: e.target.value })} />
+              ) : (
+                <select className="grow mono" value={f.fileId} onChange={(e) => update(i, { fileId: e.target.value })} style={needsFile ? { borderColor: 'var(--danger)' } : undefined}>
+                  <option value="">— choose a file —</option>
+                  {missing && <option value={f.fileId}>⚠ missing (deleted) file — re-select below</option>}
+                  {files.map((s) => <option key={s.id} value={s.id}>{s.originalName} ({formatBytes(s.size)})</option>)}
+                </select>
+              )}
+              <button className="btn icon danger" onClick={() => remove(i)}>✕</button>
+            </div>
+            {needsFile && (
+              <div className="error-text mb" style={{ marginLeft: 28 }}>
+                {missing ? 'The chosen file is no longer in the store — pick it again from the dropdown.' : 'Pick a file for this field, or it will fail when sent.'}
+              </div>
             )}
-            <button className="btn icon danger" onClick={() => remove(i)}>✕</button>
           </div>
         );
       })}
@@ -274,6 +290,51 @@ export function CaptureTab({ step, onChange }: TabProps) {
       <p className="muted">
         Sandboxed JavaScript. API: <span className="mono">variables.set(name, value[, "global"])</span>,{' '}
         <span className="mono">variables.get()</span>, <span className="mono">response.*</span>, <span className="mono">console.log()</span>, <span className="mono">fail(msg)</span>.
+      </p>
+    </div>
+  );
+}
+
+// ---------------- Poll tab ----------------
+
+const POLL_PLACEHOLDER = `// runs after every attempt — call stop() when done
+if (response.json().status === 'completed') stop();`;
+
+export function PollTab({ step, onChange }: TabProps) {
+  const p = step.polling ?? defaultPolling();
+  const setP = (patch: Partial<StepPolling>) => onChange({ polling: { ...p, ...patch } });
+
+  return (
+    <div>
+      <p className="muted">
+        Polling re-sends this request on an interval <b>until your stop condition is met</b> — or the timeout elapses,
+        which fails the step. Handy for async work: poll a status endpoint until the job is done.
+      </p>
+
+      <label className="row mb" style={{ gap: 6, cursor: 'pointer' }}>
+        <input type="checkbox" checked={p.enabled} onChange={(e) => setP({ enabled: e.target.checked })} />
+        <b>Poll this request</b>
+      </label>
+
+      <div className="row mb" style={{ gap: 16, alignItems: 'flex-end' }}>
+        <label className="field" style={{ margin: 0 }}>
+          <span>Interval (ms)</span>
+          <input type="number" min={250} step={250} style={{ width: 120 }} value={p.intervalMs} disabled={!p.enabled}
+            onChange={(e) => setP({ intervalMs: Number(e.target.value) || 0 })} />
+        </label>
+        <label className="field" style={{ margin: 0 }}>
+          <span>Timeout (ms)</span>
+          <input type="number" min={1000} step={1000} style={{ width: 140 }} value={p.timeoutMs} disabled={!p.enabled}
+            onChange={(e) => setP({ timeoutMs: Number(e.target.value) || 0 })} />
+        </label>
+      </div>
+
+      <h3>Stop condition script</h3>
+      <textarea className="code" rows={8} placeholder={POLL_PLACEHOLDER} value={p.stopScript} disabled={!p.enabled}
+        onChange={(e) => setP({ stopScript: e.target.value })} />
+      <p className="muted">
+        Sandboxed JavaScript, run after each attempt. Call <span className="mono">stop()</span> when the success condition is met.
+        API: <span className="mono">response.*</span>, <span className="mono">variables.get()</span>, <span className="mono">console.log()</span>.
       </p>
     </div>
   );

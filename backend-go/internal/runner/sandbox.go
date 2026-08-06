@@ -42,11 +42,12 @@ type SetVariable struct {
 
 // SandboxOutcome mirrors the TS SandboxOutcome.
 type SandboxOutcome struct {
-	Tests        []AssertionResult `json:"tests"`
-	Logs         []string          `json:"logs"`
-	SetVariables []SetVariable     `json:"setVariables"`
-	Failed       bool              `json:"failed"`
-	Error        string            `json:"error,omitempty"`
+	Tests         []AssertionResult `json:"tests"`
+	Logs          []string          `json:"logs"`
+	SetVariables  []SetVariable     `json:"setVariables"`
+	Failed        bool              `json:"failed"`
+	StopRequested bool              `json:"stopRequested"` // set by stop() — used by polling stop-condition scripts
+	Error         string            `json:"error,omitempty"`
 }
 
 const timeoutMS = 2000
@@ -70,7 +71,7 @@ const prelude = `
   globalThis.variables = Object.freeze({
     get: function (key) { return __getVar(String(key)); },
     set: function (key, value, scope) {
-      if (__mode === 'validate') throw new Error('variables.set() is only available in capture scripts — use the Capture tab');
+      if (__mode !== 'capture') throw new Error('variables.set() is only available in capture scripts — use the Capture tab');
       var k = String(key);
       if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(k)) throw new Error('Invalid variable name: ' + k);
       var s = scope === 'global' ? 'global' : scope === 'runtime' ? 'runtime' : 'suite';
@@ -103,6 +104,7 @@ const prelude = `
     catch (e) { __pushTest(testName, false, (e && e.message) ? e.message : String(e)); }
   };
   globalThis.fail = function (message) { throw new Error(message ? String(message) : 'fail() called'); };
+  globalThis.stop = function () { __stop(); };
   globalThis.console = Object.freeze({
     log: function () {
       var args = Array.prototype.slice.call(arguments);
@@ -144,6 +146,10 @@ func RunScript(code string, response SandboxResponse, getVariable func(key strin
 	})
 	_ = vm.Set("__log", func(call goja.FunctionCall) goja.Value {
 		outcome.Logs = append(outcome.Logs, call.Argument(0).String())
+		return goja.Undefined()
+	})
+	_ = vm.Set("__stop", func(call goja.FunctionCall) goja.Value {
+		outcome.StopRequested = true
 		return goja.Undefined()
 	})
 	_ = vm.Set("__pushTest", func(call goja.FunctionCall) goja.Value {

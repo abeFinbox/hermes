@@ -3,6 +3,9 @@ import { Link, useParams } from 'react-router-dom';
 import { api } from '../api';
 import { Info } from '../legends';
 import { Modal, useToast } from '../ui';
+import PollAttempts from '../components/PollAttempts';
+import BodyViewer from '../components/BodyViewer';
+import CurlBlock from '../components/CurlBlock';
 import type { Run, StepResult } from '../types';
 
 export default function RunDetail() {
@@ -136,6 +139,8 @@ function StepRow({ s }: { s: StepResult }) {
         {s.error && <div className="error-text mb">{s.error}</div>}
         {s.request && <div className="mono muted mb">{s.request.method} {s.request.url}</div>}
 
+        {s.curl && <CurlBlock curl={s.curl} />}
+
         {s.assertions.length > 0 && (
           <div className="mb">
             <h3>Assertions</h3>
@@ -168,21 +173,15 @@ function StepRow({ s }: { s: StepResult }) {
           </div>
         )}
 
+        {s.pollAttempts && <PollAttempts attempts={s.pollAttempts} />}
+
         {s.response && (
           <div>
-            <h3>Response body {s.response.bodyTruncated && <span className="muted">(truncated)</span>}</h3>
-            <pre className="body-view">{tryPretty(s.response.body)}</pre>
+            <h3>{s.pollAttempts ? 'Final response body' : 'Response body'}</h3>
+            <BodyViewer body={s.response.body} truncated={s.response.bodyTruncated} />
           </div>
         )}
       </div>
     </details>
   );
-}
-
-function tryPretty(text: string): string {
-  try {
-    return JSON.stringify(JSON.parse(text), null, 2);
-  } catch {
-    return text;
-  }
 }

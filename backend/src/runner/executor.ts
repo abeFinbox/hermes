@@ -8,10 +8,23 @@ import { runScript, type SandboxResponse } from './sandbox.js';
 import {
   newId,
   type Suite, type Step, type Run, type StepResult, type CycleResult, type RunSummary,
-  type AssertionResult, type CapturedValue, type Assertion, type CaptureRule,
+  type AssertionResult, type CapturedValue, type Assertion, type CaptureRule, type PollAttempt,
 } from '../types.js';
 
-const MAX_STORED_BODY = 64 * 1024;
+const MAX_STORED_BODY = 64 * 1024; // request-body preview cap
+const MAX_RUN_RESPONSE_BODY = 5 * 1024 * 1024; // persisted-run response cap (single-step Send is uncapped)
+const MAX_POLL_MS = 5 * 60 * 1000; // hard cap on total polling duration per step
+const MAX_POLL_ATTEMPT_BODY = 8 * 1024; // per-attempt body kept for poll history
+const MAX_POLL_ATTEMPTS = 50; // keep the most recent N attempts
+
+// Interruptible delay — resolves after `ms`, or early if the run is aborted.
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+  });
+}
 
 // ---------- variable resolution ----------
 
@@ -19,11 +32,27 @@ export class VarScope {
   private globalVars = new Map<string, string>();
   private suiteVars = new Map<string, string>();
   private runtimeVars = new Map<string, string>();
+  // Non-empty values of variables flagged `secret` — used to mask secrets out
+  // of the persisted cURL (see redactSecrets).
+  private secretValues = new Set<string>();
   globalsDirty = false;
 
   constructor(suite: Suite) {
-    for (const g of getGlobals()) this.globalVars.set(g.key, g.value);
-    for (const v of suite.variables) this.suiteVars.set(v.key, v.value);
+    for (const g of getGlobals()) {
+      this.globalVars.set(g.key, g.value);
+      if (g.secret && g.value) this.secretValues.add(g.value);
+    }
+    for (const v of suite.variables) {
+      this.suiteVars.set(v.key, v.value);
+      if (v.secret && v.value) this.secretValues.add(v.value);
+    }
+  }
+
+  /** Replace any secret variable's resolved value wherever it appears. */
+  redactSecrets(text: string): string {
+    let out = text;
+    for (const sv of this.secretValues) out = out.split(sv).join('<redacted>');
+    return out;
   }
 
   get(key: string): string | undefined {
@@ -147,7 +176,8 @@ function runVisualCapture(c: CaptureRule, resp: SandboxResponse): { value: strin
 
 export interface ExecuteOpts {
   signal?: AbortSignal; // aborts the in-flight HTTP request when a run is stopped
-  withCurl?: boolean; // attach a reproducible cURL of the actual request (single-step Send only)
+  withCurl?: boolean; // attach a reproducible cURL of the actual request
+  fullBody?: boolean; // keep the FULL response body (single-step Send); persisted runs stay capped
 }
 
 export async function executeStep(step: Step, scope: VarScope, suite: Suite, opts: ExecuteOpts = {}): Promise<StepResult> {
@@ -175,7 +205,8 @@ export async function executeStep(step: Step, scope: VarScope, suite: Suite, opt
 
   let data: string | FormData | undefined;
   let bodyPreview: string | undefined;
-  const sendsBody = step.request.body.mode !== 'none' && method !== 'GET' && method !== 'HEAD';
+  const bodilessMethod = method === 'GET' || method === 'HEAD';
+  const sendsBody = step.request.body.mode !== 'none' && (!bodilessMethod || !!step.request.body.sendWithGet);
   if (sendsBody && step.request.body.mode === 'form-data') {
     // multipart: text parts appended as strings, file parts read from the managed store.
     // axios sets the multipart Content-Type (with boundary) itself, so we don't set it here.
@@ -188,8 +219,8 @@ export async function executeStep(step: Step, scope: VarScope, suite: Suite, opt
         const stored = resolveStoredFile(f.fileId);
         if (!stored) {
           result.status = 'error';
-          result.error = `Field "${key}" references a file that is no longer in the store (upload it again on the Files page)`;
-          result.request = { method, url, headers: redact(headers) };
+          result.error = `Field "${key}" isn't linked to a file in the store. Open this request's form-data body and re-select the file from the dropdown. (A re-uploaded file gets a new id, so re-uploading alone won't fix it — you must pick it again.)`;
+          result.request = { method, url, headers: redactHeaders(headers) };
           return result;
         }
         const buf = readFileSync(stored.path);
@@ -216,54 +247,113 @@ export async function executeStep(step: Step, scope: VarScope, suite: Suite, opt
   }
 
   const unresolved = scope.unresolvedIn(url);
-  result.request = { method, url, headers: redact(headers), body: bodyPreview && bodyPreview.length > MAX_STORED_BODY ? bodyPreview.slice(0, MAX_STORED_BODY) : bodyPreview };
-  if (opts.withCurl) result.curl = buildCurl(method, url, headers, step, scope);
+  result.request = { method, url, headers: redactHeaders(headers), body: bodyPreview && bodyPreview.length > MAX_STORED_BODY ? bodyPreview.slice(0, MAX_STORED_BODY) : bodyPreview };
+  // Send (fullBody) gets a paste-runnable curl; persisted runs get a redacted one.
+  if (opts.withCurl) result.curl = buildCurl(method, url, headers, step, scope, !opts.fullBody);
   if (unresolved.length) {
     result.status = 'error';
     result.error = `Unresolved variables in URL: ${unresolved.map((u) => `{{${u}}}`).join(', ')}`;
     return result;
   }
 
-  // send
-  const started = Date.now();
-  let resp: SandboxResponse;
-  try {
-    const axiosResp = await axios.request({
-      method: method as any,
-      url,
-      headers,
-      data,
-      timeout: suite.settings.requestTimeoutMs,
-      responseType: 'text',
-      transformResponse: [(d) => d],
-      validateStatus: () => true,
-      maxRedirects: 5,
-      signal: opts.signal,
-    });
-    const timeMs = Date.now() - started;
-    const respHeaders: Record<string, string> = {};
-    for (const [k, v] of Object.entries(axiosResp.headers || {})) respHeaders[k.toLowerCase()] = String(v);
-    const bodyText = typeof axiosResp.data === 'string' ? axiosResp.data : JSON.stringify(axiosResp.data ?? '');
-    resp = { status: axiosResp.status, statusText: axiosResp.statusText || '', headers: respHeaders, time: timeMs, bodyText };
-  } catch (e: any) {
-    if (opts.signal?.aborted) {
-      // run was stopped mid-request — treat this step as skipped, not a real error
-      result.status = 'skipped';
-      result.error = 'Stopped';
-      return result;
+  // send — a single attempt. Returns the response, or a terminal outcome
+  // ('aborted' | 'error') already recorded on `result`.
+  const sendOnce = async (): Promise<{ resp?: SandboxResponse; done?: true }> => {
+    const started = Date.now();
+    try {
+      const axiosResp = await axios.request({
+        method: method as any,
+        url,
+        headers,
+        data,
+        timeout: suite.settings.requestTimeoutMs,
+        responseType: 'text',
+        transformResponse: [(d) => d],
+        validateStatus: () => true,
+        maxRedirects: 5,
+        signal: opts.signal,
+      });
+      const timeMs = Date.now() - started;
+      const respHeaders: Record<string, string> = {};
+      for (const [k, v] of Object.entries(axiosResp.headers || {})) respHeaders[k.toLowerCase()] = String(v);
+      const bodyText = typeof axiosResp.data === 'string' ? axiosResp.data : JSON.stringify(axiosResp.data ?? '');
+      return { resp: { status: axiosResp.status, statusText: axiosResp.statusText || '', headers: respHeaders, time: timeMs, bodyText } };
+    } catch (e: any) {
+      if (opts.signal?.aborted) {
+        result.status = 'skipped';
+        result.error = 'Stopped';
+        return { done: true };
+      }
+      result.status = 'error';
+      result.error = `Request failed: ${e?.message || String(e)}`;
+      return { done: true };
     }
-    result.status = 'error';
-    result.error = `Request failed: ${e?.message || String(e)}`;
-    return result;
+  };
+
+  let resp!: SandboxResponse;
+  const poll = step.polling;
+  if (poll?.enabled && poll.stopScript?.trim()) {
+    // re-send on an interval until stop() is called or the timeout elapses
+    const timeoutMs = Math.min(Math.max(1000, poll.timeoutMs || 30000), MAX_POLL_MS);
+    const intervalMs = Math.max(250, poll.intervalMs || 2000);
+    const deadline = Date.now() + timeoutMs;
+    const startedAt = Date.now();
+    const attemptsLog: PollAttempt[] = [];
+    let stopped = false;
+    let attempts = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const s = await sendOnce();
+      if (s.done) return result;
+      resp = s.resp!;
+      attempts++;
+      const out = runScript(poll.stopScript, resp, (k) => scope.get(k), 'poll');
+      result.logs.push(...out.logs);
+      const scriptErr = !!out.error;
+      // record this attempt's response so the UI can show poll history
+      attemptsLog.push({
+        attempt: attempts,
+        status: resp.status,
+        statusText: resp.statusText,
+        timeMs: resp.time,
+        body: resp.bodyText.slice(0, MAX_POLL_ATTEMPT_BODY),
+        bodyTruncated: resp.bodyText.length > MAX_POLL_ATTEMPT_BODY,
+        stopped: out.stopRequested,
+      });
+      if (attemptsLog.length > MAX_POLL_ATTEMPTS) attemptsLog.splice(0, attemptsLog.length - MAX_POLL_ATTEMPTS);
+      if (scriptErr) {
+        result.assertions.push({ name: 'poll stop condition', passed: false, message: out.error! });
+        result.status = 'failed';
+        break;
+      }
+      if (out.stopRequested) { stopped = true; break; }
+      if (Date.now() + intervalMs >= deadline) break;
+      if (opts.signal?.aborted) { result.status = 'skipped'; result.error = 'Stopped'; return result; }
+      await sleep(intervalMs, opts.signal);
+      if (opts.signal?.aborted) { result.status = 'skipped'; result.error = 'Stopped'; return result; }
+    }
+    result.pollAttempts = attemptsLog;
+    result.logs.push(`[poll] ${attempts} attempt(s) over ${Date.now() - startedAt}ms`);
+    if (!stopped && result.status === 'passed') {
+      result.assertions.push({ name: 'polling', passed: false, message: `Stop condition not met within ${timeoutMs}ms (${attempts} attempts)` });
+      result.status = 'failed';
+    }
+  } else {
+    const s = await sendOnce();
+    if (s.done) return result;
+    resp = s.resp!;
   }
 
+  // Single-step Send (opts.withCurl) is for debugging — keep the FULL body.
+  // Persisted runs cap it so the runs table doesn't bloat across cycles/steps.
+  const bodyCap = opts.fullBody ? resp.bodyText.length : MAX_RUN_RESPONSE_BODY;
   result.response = {
     status: resp.status,
     statusText: resp.statusText,
     headers: resp.headers,
     timeMs: resp.time,
-    body: resp.bodyText.slice(0, MAX_STORED_BODY),
-    bodyTruncated: resp.bodyText.length > MAX_STORED_BODY,
+    body: resp.bodyText.slice(0, bodyCap),
+    bodyTruncated: resp.bodyText.length > bodyCap,
   };
 
   // validations: visual then script
@@ -313,7 +403,7 @@ export async function executeStep(step: Step, scope: VarScope, suite: Suite, opt
   return result;
 }
 
-function redact(headers: Record<string, string>): Record<string, string> {
+function redactHeaders(headers: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(headers)) {
     out[k] = /authorization|api-key|x-api-key|cookie/i.test(k) ? v.slice(0, 12) + '…(redacted)' : v;
@@ -321,15 +411,27 @@ function redact(headers: Record<string, string>): Record<string, string> {
   return out;
 }
 
-// Reproducible cURL for the actual (variable-resolved) request. Uses the real,
-// UN-redacted headers/body so the command works when pasted into a terminal —
-// only produced for the single-step "Send" (a debug action; never persisted).
-function buildCurl(method: string, url: string, headers: Record<string, string>, step: Step, scope: VarScope): string {
+// Reproducible cURL for the actual (variable-resolved) request. When `redact`
+// is set (the copy PERSISTED with a run), sensitive headers and secret-variable
+// values are masked. The single-step "Send" builds it unredacted so the command
+// works when pasted into a terminal.
+function buildCurl(method: string, url: string, headers: Record<string, string>, step: Step, scope: VarScope, redact = false): string {
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`; // single-quote for POSIX shells
-  const lines = [`curl -X ${method} ${q(url)}`];
-  for (const [k, v] of Object.entries(headers)) lines.push(`-H ${q(`${k}: ${v}`)}`);
+  const mask = (s: string) => (redact ? scope.redactSecrets(s) : s);
+  const lines = [`curl -X ${method} ${q(mask(url))}`];
+  for (const [k, v] of Object.entries(headers)) {
+    let value = v;
+    if (redact) {
+      value = mask(value);
+      if (/authorization|api-key|x-api-key|cookie/i.test(k) && value.length > 12) {
+        value = value.slice(0, 12) + '…(redacted)';
+      }
+    }
+    lines.push(`-H ${q(`${k}: ${value}`)}`);
+  }
   const body = step.request.body;
-  const sendsBody = body.mode !== 'none' && method !== 'GET' && method !== 'HEAD';
+  const bodilessMethod = method === 'GET' || method === 'HEAD';
+  const sendsBody = body.mode !== 'none' && (!bodilessMethod || !!body.sendWithGet);
   if (sendsBody) {
     if (body.mode === 'form-data') {
       for (const f of body.formData || []) {
@@ -337,13 +439,13 @@ function buildCurl(method: string, url: string, headers: Record<string, string>,
         const key = scope.resolve(f.key);
         if (f.type === 'file') {
           const stored = resolveStoredFile(f.fileId);
-          lines.push(`-F ${q(`${key}=@${stored ? stored.name : '<missing-file>'}`)}`);
+          lines.push(`-F ${q(`${mask(key)}=@${stored ? stored.name : '<missing-file>'}`)}`);
         } else {
-          lines.push(`-F ${q(`${key}=${scope.resolve(f.value)}`)}`);
+          lines.push(`-F ${q(`${mask(key)}=${mask(scope.resolve(f.value))}`)}`);
         }
       }
     } else {
-      lines.push(`--data-raw ${q(scope.resolve(body.content))}`);
+      lines.push(`--data-raw ${q(mask(scope.resolve(body.content)))}`);
     }
   }
   return lines.join(' \\\n  ');
@@ -403,7 +505,7 @@ async function executeRun(run: Run, suite: Suite) {
           cycleResult.steps.push({ stepId: step.id, name: step.name, status: 'skipped', assertions: [], captured: [], logs: [] });
           continue;
         }
-        const stepResult = await executeStep(step, scope, suite, { signal: ctrl.abort.signal });
+        const stepResult = await executeStep(step, scope, suite, { signal: ctrl.abort.signal, withCurl: true });
         cycleResult.steps.push(stepResult);
         if (stepResult.status !== 'passed') {
           cycleResult.passed = false;

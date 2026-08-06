@@ -58,7 +58,7 @@ runsRouter.post('/step', async (req, res) => {
   };
   try {
     const scope = new VarScope(suite);
-    const result = await executeStep(step as Step, scope, suite, { withCurl: true });
+    const result = await executeStep(step as Step, scope, suite, { withCurl: true, fullBody: true });
     res.json(result);
   } catch (e: any) {
     res.status(500).json({ error: e?.message || 'Step execution failed' });

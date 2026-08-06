@@ -22,7 +22,7 @@ export interface StepRequest {
   url: string;
   headers: KV[];
   params: KV[];
-  body: { mode: BodyMode; content: string; formData?: FormDataField[] };
+  body: { mode: BodyMode; content: string; formData?: FormDataField[]; sendWithGet?: boolean };
   auth:
     | { type: 'none' }
     | { type: 'bearer'; token: string }
@@ -54,6 +54,15 @@ export interface CaptureRule {
   scope: 'suite' | 'global';
 }
 
+// Optional polling: re-send the request on an interval until the stop script
+// signals success (calls stop()) or the timeout elapses. Off by default.
+export interface StepPolling {
+  enabled: boolean;
+  intervalMs: number; // wait between attempts
+  timeoutMs: number; // give up (and fail the step) after this long
+  stopScript: string; // sandbox script — call stop() when the success condition is met
+}
+
 export interface Step {
   id: string;
   name: string;
@@ -62,8 +71,13 @@ export interface Step {
   request: StepRequest;
   validations: { visual: Assertion[]; script: string };
   captures: { visual: CaptureRule[]; script: string };
+  polling?: StepPolling;
   postmanEvents?: unknown[]; // original pm scripts, preserved but not executed
   sourceRequest?: StepRequest; // snapshot at import time, for "reset to original"
+}
+
+export function defaultPolling(): StepPolling {
+  return { enabled: false, intervalMs: 2000, timeoutMs: 30000, stopScript: '' };
 }
 
 export interface SuiteVariable {
@@ -109,6 +123,17 @@ export interface CapturedValue {
   scope: 'suite' | 'global' | 'runtime';
 }
 
+// One attempt of a polled request, kept so the UI can show poll history.
+export interface PollAttempt {
+  attempt: number;
+  status: number;
+  statusText: string;
+  timeMs: number;
+  body: string;
+  bodyTruncated: boolean;
+  stopped: boolean; // true on the attempt where stop() was called
+}
+
 export interface StepResult {
   stepId: string;
   name: string;
@@ -118,6 +143,7 @@ export interface StepResult {
   assertions: AssertionResult[];
   captured: CapturedValue[];
   logs: string[];
+  pollAttempts?: PollAttempt[]; // present when the step polled — each re-send's response
   error?: string;
   curl?: string; // reproducible cURL of the actual request — only set for single-step "Send" (never persisted)
 }

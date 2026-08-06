@@ -24,32 +24,56 @@ import (
 	"github.com/ohler55/ojg/oj"
 )
 
-const maxStoredBody = 64 * 1024
+const maxStoredBody = 64 * 1024               // request-body preview cap
+const maxRunResponseBody = 5 * 1024 * 1024    // persisted-run response cap (single-step Send is uncapped)
+const maxPollMs = 5 * 60 * 1000 // hard cap on total polling duration per step
+const maxPollAttemptBody = 8 * 1024 // per-attempt body kept for poll history
+const maxPollAttempts = 50          // keep the most recent N attempts
+
+// sleepCtx waits d, returning false early if ctx is cancelled (run stopped).
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
 
 // ---------- variable resolution ----------
 
 // VarScope resolves {{variables}} with runtime > suite > global precedence,
 // mirroring the TS VarScope.
 type VarScope struct {
-	globalVars  map[string]string
-	suiteVars   map[string]string
-	runtimeVars map[string]string
+	globalVars   map[string]string
+	suiteVars    map[string]string
+	runtimeVars  map[string]string
+	secretValues map[string]bool // non-empty secret variable values → used to redact curl
 	GlobalsDirty bool
 }
 
 func NewVarScope(suite model.Suite) *VarScope {
 	vs := &VarScope{
-		globalVars:  map[string]string{},
-		suiteVars:   map[string]string{},
-		runtimeVars: map[string]string{},
+		globalVars:   map[string]string{},
+		suiteVars:    map[string]string{},
+		runtimeVars:  map[string]string{},
+		secretValues: map[string]bool{},
 	}
 	if globals, err := store.GetGlobals(); err == nil {
 		for _, g := range globals {
 			vs.globalVars[g.Key] = g.Value
+			if g.Secret && g.Value != "" {
+				vs.secretValues[g.Value] = true
+			}
 		}
 	}
 	for _, v := range suite.Variables {
 		vs.suiteVars[v.Key] = v.Value
+		if v.Secret && v.Value != "" {
+			vs.secretValues[v.Value] = true
+		}
 	}
 	return vs
 }
@@ -97,6 +121,14 @@ func (vs *VarScope) Resolve(text string) string {
 			}
 			return m
 		})
+	}
+	return out
+}
+
+func (vs *VarScope) RedactSecrets(text string) string {
+	out := text
+	for sv := range vs.secretValues {
+		out = strings.ReplaceAll(out, sv, "<redacted>")
 	}
 	return out
 }
@@ -232,6 +264,7 @@ func runVisualCapture(c model.CaptureRule, resp SandboxResponse) (string, error)
 type ExecuteOpts struct {
 	Ctx      context.Context
 	WithCurl bool
+	FullBody bool
 }
 
 var sharedClient = &http.Client{
@@ -291,7 +324,8 @@ func ExecuteStep(step model.Step, scope *VarScope, suite model.Suite, opts Execu
 	var bodyBytes []byte
 	var bodyPreview *string
 	var multipartContentType string
-	sendsBody := step.Request.Body.Mode != "none" && method != "GET" && method != "HEAD"
+	bodilessMethod := method == "GET" || method == "HEAD"
+	sendsBody := step.Request.Body.Mode != "none" && (!bodilessMethod || step.Request.Body.SendWithGet)
 
 	if sendsBody && step.Request.Body.Mode == "form-data" {
 		var buf bytes.Buffer
@@ -306,8 +340,8 @@ func ExecuteStep(step model.Step, scope *VarScope, suite model.Suite, opts Execu
 				path, name, mime, ok := store.ResolveStoredFile(f.FileID)
 				if !ok {
 					result.Status = "error"
-					result.Error = fmt.Sprintf("Field %q references a file that is no longer in the store (upload it again on the Files page)", key)
-					result.Request = &model.RequestSnapshot{Method: method, URL: reqURL, Headers: redact(headers)}
+					result.Error = fmt.Sprintf("Field %q isn't linked to a file in the store. Open this request's form-data body and re-select the file from the dropdown. (A re-uploaded file gets a new id, so re-uploading alone won't fix it — you must pick it again.)", key)
+					result.Request = &model.RequestSnapshot{Method: method, URL: reqURL, Headers: redactHeaders(headers)}
 					return result
 				}
 				data, err := os.ReadFile(path)
@@ -348,7 +382,7 @@ func ExecuteStep(step model.Step, scope *VarScope, suite model.Suite, opts Execu
 	}
 
 	unresolved := scope.UnresolvedIn(reqURL)
-	snap := &model.RequestSnapshot{Method: method, URL: reqURL, Headers: redact(headers)}
+	snap := &model.RequestSnapshot{Method: method, URL: reqURL, Headers: redactHeaders(headers)}
 	if bodyPreview != nil {
 		bp := *bodyPreview
 		if len(bp) > maxStoredBody {
@@ -357,8 +391,9 @@ func ExecuteStep(step model.Step, scope *VarScope, suite model.Suite, opts Execu
 		snap.Body = &bp
 	}
 	result.Request = snap
+	// Send (fullBody) gets a paste-runnable curl; persisted runs get a redacted one.
 	if opts.WithCurl {
-		result.Curl = buildCurl(method, reqURL, headers, step, scope)
+		result.Curl = buildCurl(method, reqURL, headers, step, scope, !opts.FullBody)
 	}
 	if len(unresolved) > 0 {
 		var parts []string
@@ -370,64 +405,145 @@ func ExecuteStep(step model.Step, scope *VarScope, suite model.Suite, opts Execu
 		return result
 	}
 
-	// send
-	timeout := time.Duration(suite.Settings.RequestTimeoutMs) * time.Millisecond
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	// send — one attempt. Returns the response, or done=true with a terminal
+	// outcome ('skipped'/'error') already recorded on result.
+	sendOnce := func() (SandboxResponse, bool) {
+		timeout := time.Duration(suite.Settings.RequestTimeoutMs) * time.Millisecond
+		reqCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+		httpReq, err := http.NewRequestWithContext(reqCtx, method, reqURL, bodyReader)
+		if err != nil {
+			result.Status = "error"
+			result.Error = "Request failed: " + err.Error()
+			return SandboxResponse{}, true
+		}
+		for k, v := range headers {
+			httpReq.Header.Set(k, v)
+		}
+		if multipartContentType != "" {
+			httpReq.Header.Set("Content-Type", multipartContentType)
+		}
+		started := time.Now()
+		httpResp, err := sharedClient.Do(httpReq)
+		if err != nil {
+			if ctx.Err() != nil {
+				result.Status = "skipped"
+				result.Error = "Stopped"
+				return SandboxResponse{}, true
+			}
+			result.Status = "error"
+			result.Error = "Request failed: " + err.Error()
+			return SandboxResponse{}, true
+		}
+		defer httpResp.Body.Close()
+		rawBody, _ := io.ReadAll(httpResp.Body)
+		timeMs := float64(time.Since(started).Milliseconds())
+		respHeaders := map[string]string{}
+		for k, vals := range httpResp.Header {
+			respHeaders[strings.ToLower(k)] = strings.Join(vals, ", ")
+		}
+		return SandboxResponse{
+			Status: httpResp.StatusCode, StatusText: http.StatusText(httpResp.StatusCode),
+			Headers: respHeaders, Time: timeMs, BodyText: string(rawBody),
+		}, false
+	}
 
-	var bodyReader io.Reader
-	if bodyBytes != nil {
-		bodyReader = bytes.NewReader(bodyBytes)
-	}
-	httpReq, err := http.NewRequestWithContext(reqCtx, method, reqURL, bodyReader)
-	if err != nil {
-		result.Status = "error"
-		result.Error = "Request failed: " + err.Error()
-		return result
-	}
-	for k, v := range headers {
-		httpReq.Header.Set(k, v)
-	}
-	if multipartContentType != "" {
-		httpReq.Header.Set("Content-Type", multipartContentType)
-	}
-
-	started := time.Now()
-	httpResp, err := sharedClient.Do(httpReq)
-	if err != nil {
-		if ctx.Err() != nil {
-			// run was stopped mid-request — treat as skipped, not a real error
-			result.Status = "skipped"
-			result.Error = "Stopped"
+	var resp SandboxResponse
+	if poll := step.Polling; poll != nil && poll.Enabled && strings.TrimSpace(poll.StopScript) != "" {
+		// re-send on an interval until stop() is called or the timeout elapses
+		timeoutMs := poll.TimeoutMs
+		if timeoutMs < 1000 {
+			timeoutMs = 1000
+		}
+		if timeoutMs > maxPollMs {
+			timeoutMs = maxPollMs
+		}
+		intervalMs := poll.IntervalMs
+		if intervalMs < 250 {
+			intervalMs = 250
+		}
+		deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+		startedAt := time.Now()
+		attemptsLog := []model.PollAttempt{}
+		stopped := false
+		attempts := 0
+		for {
+			r, done := sendOnce()
+			if done {
+				return result
+			}
+			resp = r
+			attempts++
+			out := RunScript(poll.StopScript, resp, scope.Get, "poll")
+			result.Logs = append(result.Logs, out.Logs...)
+			// record this attempt's response so the UI can show poll history
+			body := resp.BodyText
+			truncated := false
+			if len(body) > maxPollAttemptBody {
+				body = body[:maxPollAttemptBody]
+				truncated = true
+			}
+			attemptsLog = append(attemptsLog, model.PollAttempt{
+				Attempt: attempts, Status: resp.Status, StatusText: resp.StatusText, TimeMs: resp.Time,
+				Body: body, BodyTruncated: truncated, Stopped: out.StopRequested,
+			})
+			if len(attemptsLog) > maxPollAttempts {
+				attemptsLog = attemptsLog[len(attemptsLog)-maxPollAttempts:]
+			}
+			if out.Error != "" {
+				result.Assertions = append(result.Assertions, model.AssertionResult{Name: "poll stop condition", Passed: false, Message: out.Error})
+				result.Status = "failed"
+				break
+			}
+			if out.StopRequested {
+				stopped = true
+				break
+			}
+			if !time.Now().Add(time.Duration(intervalMs) * time.Millisecond).Before(deadline) {
+				break
+			}
+			if ctx.Err() != nil {
+				result.Status = "skipped"
+				result.Error = "Stopped"
+				return result
+			}
+			if !sleepCtx(ctx, time.Duration(intervalMs)*time.Millisecond) {
+				result.Status = "skipped"
+				result.Error = "Stopped"
+				return result
+			}
+		}
+		result.PollAttempts = attemptsLog
+		result.Logs = append(result.Logs, fmt.Sprintf("[poll] %d attempt(s) over %dms", attempts, time.Since(startedAt).Milliseconds()))
+		if !stopped && result.Status == "passed" {
+			result.Assertions = append(result.Assertions, model.AssertionResult{Name: "polling", Passed: false, Message: fmt.Sprintf("Stop condition not met within %dms (%d attempts)", timeoutMs, attempts)})
+			result.Status = "failed"
+		}
+	} else {
+		r, done := sendOnce()
+		if done {
 			return result
 		}
-		result.Status = "error"
-		result.Error = "Request failed: " + err.Error()
-		return result
-	}
-	defer httpResp.Body.Close()
-	rawBody, _ := io.ReadAll(httpResp.Body)
-	timeMs := float64(time.Since(started).Milliseconds())
-
-	respHeaders := map[string]string{}
-	for k, vals := range httpResp.Header {
-		respHeaders[strings.ToLower(k)] = strings.Join(vals, ", ")
-	}
-	resp := SandboxResponse{
-		Status:     httpResp.StatusCode,
-		StatusText: http.StatusText(httpResp.StatusCode),
-		Headers:    respHeaders,
-		Time:       timeMs,
-		BodyText:   string(rawBody),
+		resp = r
 	}
 
+	// Single-step Send (opts.FullBody) is for debugging — keep the FULL body.
+	// Persisted runs cap it so the runs table doesn't bloat across cycles/steps.
+	bodyCap := maxRunResponseBody
+	if opts.FullBody {
+		bodyCap = len(resp.BodyText)
+	}
 	storedBody := resp.BodyText
-	if len(storedBody) > maxStoredBody {
-		storedBody = storedBody[:maxStoredBody]
+	if len(storedBody) > bodyCap {
+		storedBody = storedBody[:bodyCap]
 	}
 	result.Response = &model.ResponseSnapshot{
 		Status: resp.Status, StatusText: resp.StatusText, Headers: resp.Headers,
-		TimeMs: resp.Time, Body: storedBody, BodyTruncated: len(resp.BodyText) > maxStoredBody,
+		TimeMs: resp.Time, Body: storedBody, BodyTruncated: len(resp.BodyText) > bodyCap,
 	}
 
 	// validations: visual then script
@@ -489,7 +605,7 @@ func ExecuteStep(step model.Step, scope *VarScope, suite model.Suite, opts Execu
 
 var redactRe = regexp.MustCompile(`(?i)authorization|api-key|x-api-key|cookie`)
 
-func redact(headers map[string]string) map[string]string {
+func redactHeaders(headers map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range headers {
 		if redactRe.MatchString(k) {
@@ -505,14 +621,28 @@ func redact(headers map[string]string) map[string]string {
 	return out
 }
 
-func buildCurl(method, reqURL string, headers map[string]string, step model.Step, scope *VarScope) string {
+func buildCurl(method, reqURL string, headers map[string]string, step model.Step, scope *VarScope, redact bool) string {
 	q := func(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
-	lines := []string{fmt.Sprintf("curl -X %s %s", method, q(reqURL))}
+	mask := func(s string) string {
+		if redact {
+			return scope.RedactSecrets(s)
+		}
+		return s
+	}
+	lines := []string{fmt.Sprintf("curl -X %s %s", method, q(mask(reqURL)))}
 	for k, v := range headers {
+		// If redacting, mask secret values; also truncate sensitive headers
+		if redact {
+			v = mask(v)
+			if redactRe.MatchString(k) && len(v) > 12 {
+				v = v[:12] + "…(redacted)"
+			}
+		}
 		lines = append(lines, "-H "+q(k+": "+v))
 	}
 	body := step.Request.Body
-	sendsBody := body.Mode != "none" && method != "GET" && method != "HEAD"
+	bodilessMethod := method == "GET" || method == "HEAD"
+	sendsBody := body.Mode != "none" && (!bodilessMethod || body.SendWithGet)
 	if sendsBody {
 		if body.Mode == "form-data" {
 			for _, f := range body.FormData {
@@ -525,13 +655,13 @@ func buildCurl(method, reqURL string, headers map[string]string, step model.Step
 					if !ok {
 						name = "<missing-file>"
 					}
-					lines = append(lines, "-F "+q(key+"=@"+name))
+					lines = append(lines, "-F "+q(mask(key)+"=@"+name))
 				} else {
-					lines = append(lines, "-F "+q(key+"="+scope.Resolve(f.Value)))
+					lines = append(lines, "-F "+q(mask(key)+"="+mask(scope.Resolve(f.Value))))
 				}
 			}
 		} else {
-			lines = append(lines, "--data-raw "+q(scope.Resolve(body.Content)))
+			lines = append(lines, "--data-raw "+q(mask(scope.Resolve(body.Content))))
 		}
 	}
 	return strings.Join(lines, " \\\n  ")
@@ -597,7 +727,7 @@ func executeRun(run model.Run, suite model.Suite, ctx context.Context) {
 				})
 				continue
 			}
-			sr := ExecuteStep(step, scope, suite, ExecuteOpts{Ctx: ctx})
+			sr := ExecuteStep(step, scope, suite, ExecuteOpts{Ctx: ctx, WithCurl: true})
 			run.CycleResults[idx].Steps = append(run.CycleResults[idx].Steps, sr)
 			if sr.Status != "passed" {
 				run.CycleResults[idx].Passed = false

@@ -21,6 +21,7 @@ export interface SandboxOutcome {
   logs: string[];
   setVariables: Array<{ key: string; value: string; scope: 'suite' | 'global' | 'runtime' }>;
   failed: boolean;
+  stopRequested: boolean; // set by stop() — used by polling stop-condition scripts
   error?: string;
 }
 
@@ -30,9 +31,9 @@ export function runScript(
   code: string,
   response: SandboxResponse,
   getVariable: (key: string) => string | undefined,
-  mode: 'capture' | 'validate',
+  mode: 'capture' | 'validate' | 'poll',
 ): SandboxOutcome {
-  const outcome: SandboxOutcome = { tests: [], logs: [], setVariables: [], failed: false };
+  const outcome: SandboxOutcome = { tests: [], logs: [], setVariables: [], failed: false, stopRequested: false };
   if (!code || !code.trim()) return outcome;
 
   let parsedJson: unknown;
@@ -57,7 +58,7 @@ export function runScript(
   const variablesApi = Object.freeze({
     get: (key: string) => getVariable(String(key)),
     set: (key: string, value: unknown, scope?: string) => {
-      if (mode === 'validate') throw new Error('variables.set() is only available in capture scripts — use the Capture tab');
+      if (mode !== 'capture') throw new Error('variables.set() is only available in capture scripts — use the Capture tab');
       const k = String(key);
       if (!/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(k)) throw new Error(`Invalid variable name: ${k}`);
       const s = scope === 'global' ? 'global' : scope === 'runtime' ? 'runtime' : 'suite';
@@ -106,6 +107,10 @@ export function runScript(
     },
     fail: (message: unknown) => {
       throw new Error(message ? String(message) : 'fail() called');
+    },
+    // used by polling stop-condition scripts: call when the success condition is met
+    stop: () => {
+      outcome.stopRequested = true;
     },
     console: Object.freeze({
       log: (...args: unknown[]) => {

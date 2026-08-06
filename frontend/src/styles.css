@@ -350,3 +350,12 @@ body, .sidebar, .topbar, .card, .btn, .step-item, .theme-card, table.list td, ta
 
 /* login: allowlisted (no-captcha) accounts */
 .captcha-exempt-note { font-size: 12px; color: var(--success); background: color-mix(in srgb, var(--success) 12%, var(--surface)); border: 1px solid color-mix(in srgb, var(--success) 30%, var(--border)); border-radius: var(--radius); padding: 8px 10px; }
+
+/* poll attempt history rows */
+.poll-attempt { background: var(--surface-2); }
+.poll-attempt > summary { font-size: 12px; }
+
+/* response body viewer — toolbar + larger, resizable panel */
+.body-viewer-toolbar { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+pre.body-view.large { max-height: 60vh; min-height: 140px; resize: vertical; }
+pre.body-view.nowrap { white-space: pre; word-break: normal; }

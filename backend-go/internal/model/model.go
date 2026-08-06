@@ -22,9 +22,10 @@ type FormDataField struct {
 }
 
 type Body struct {
-	Mode     string          `json:"mode"` // none | raw | json | form | form-data
-	Content  string          `json:"content"`
-	FormData []FormDataField `json:"formData,omitempty"`
+	Mode        string          `json:"mode"` // none | raw | json | form | form-data
+	Content     string          `json:"content"`
+	FormData    []FormDataField `json:"formData,omitempty"`
+	SendWithGet bool            `json:"sendWithGet,omitempty"`
 }
 
 // Auth mirrors the TS discriminated union. Fields are all optional so the same
@@ -70,6 +71,15 @@ type Captures struct {
 	Script string        `json:"script"`
 }
 
+// StepPolling re-sends the request on an interval until the stop script calls
+// stop() or the timeout elapses. Off by default.
+type StepPolling struct {
+	Enabled    bool   `json:"enabled"`
+	IntervalMs int    `json:"intervalMs"`
+	TimeoutMs  int    `json:"timeoutMs"`
+	StopScript string `json:"stopScript"`
+}
+
 type Step struct {
 	ID            string        `json:"id"`
 	Name          string        `json:"name"`
@@ -78,6 +88,7 @@ type Step struct {
 	Request       StepRequest   `json:"request"`
 	Validations   Validations   `json:"validations"`
 	Captures      Captures      `json:"captures"`
+	Polling       *StepPolling  `json:"polling,omitempty"`
 	PostmanEvents []interface{} `json:"postmanEvents,omitempty"`
 	SourceRequest *StepRequest  `json:"sourceRequest,omitempty"`
 }
@@ -141,17 +152,29 @@ type ResponseSnapshot struct {
 	BodyTruncated bool              `json:"bodyTruncated"`
 }
 
+// PollAttempt is one attempt of a polled request, kept for poll-history UI.
+type PollAttempt struct {
+	Attempt       int     `json:"attempt"`
+	Status        int     `json:"status"`
+	StatusText    string  `json:"statusText"`
+	TimeMs        float64 `json:"timeMs"`
+	Body          string  `json:"body"`
+	BodyTruncated bool    `json:"bodyTruncated"`
+	Stopped       bool    `json:"stopped"`
+}
+
 type StepResult struct {
-	StepID     string            `json:"stepId"`
-	Name       string            `json:"name"`
-	Status     string            `json:"status"` // passed | failed | error | skipped
-	Request    *RequestSnapshot  `json:"request,omitempty"`
-	Response   *ResponseSnapshot `json:"response,omitempty"`
-	Assertions []AssertionResult `json:"assertions"`
-	Captured   []CapturedValue   `json:"captured"`
-	Logs       []string          `json:"logs"`
-	Error      string            `json:"error,omitempty"`
-	Curl       string            `json:"curl,omitempty"`
+	StepID       string            `json:"stepId"`
+	Name         string            `json:"name"`
+	Status       string            `json:"status"` // passed | failed | error | skipped
+	Request      *RequestSnapshot  `json:"request,omitempty"`
+	Response     *ResponseSnapshot `json:"response,omitempty"`
+	Assertions   []AssertionResult `json:"assertions"`
+	Captured     []CapturedValue   `json:"captured"`
+	Logs         []string          `json:"logs"`
+	PollAttempts []PollAttempt     `json:"pollAttempts,omitempty"`
+	Error        string            `json:"error,omitempty"`
+	Curl         string            `json:"curl,omitempty"`
 }
 
 type CycleResult struct {
