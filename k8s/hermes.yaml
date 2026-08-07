@@ -59,24 +59,51 @@ spec:
               valueFrom: { secretKeyRef: { name: hermes-secrets, key: ADMIN_USER } }
             - name: ADMIN_PASSWORD
               valueFrom: { secretKeyRef: { name: hermes-secrets, key: ADMIN_PASSWORD } }
+            # Hera (k6 load testing) — OFF here on purpose. The limits below are
+            # 500m CPU, and CFS throttling stalls k6's own userspace timing loop,
+            # so the latencies it reported would be measuring that throttling
+            # rather than your target. Hera additionally refuses to start below
+            # 1000m unless HERA_ALLOW_CONSTRAINED=1. See the enablement block at
+            # the bottom of this file before turning it on.
+            - name: HERA_ENABLED
+              value: "0"
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             httpGet: { path: /api/health, port: 4000 }
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # timeoutSeconds and failureThreshold are set EXPLICITLY here, and they
+          # matter whether or not Hera is enabled: the defaults are 1s and 3, so
+          # three slow probes 20s apart kill the pod after 60s of ANY CPU
+          # contention — and with strategy: Recreate on a ReadWriteOnce PVC that
+          # means a full teardown and recreate, potentially mid-run.
           livenessProbe:
             httpGet: { path: /api/health, port: 4000 }
             initialDelaySeconds: 10
             periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
+            # Deliberately NOT raised for Hera: bumping every existing
+            # deployment to a bigger request can make the pod unschedulable on a
+            # small cluster, which is a worse failure than Hera being off.
             requests: { cpu: "100m", memory: "128Mi" }
-            limits: { cpu: "500m", memory: "512Mi" }
+            limits: { cpu: "500m", memory: "512Mi", ephemeral-storage: "512Mi" }
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: hermes-data
+        # k6 resolves its config directory from HOME, which distroless does not
+        # set; Hera points the child process at /tmp.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
 ---
 apiVersion: v1
 kind: Service
@@ -118,3 +145,46 @@ spec:
 #   metrics:
 #     - type: Resource
 #       resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+
+# --- Enabling Hera (k6 load testing) on Kubernetes ---
+# Hera runs k6 as a child of the API process, so it competes for the pod's CPU
+# with the very API it is measuring. At the 500m limit above, CFS throttling
+# stalls k6's timing loop and the reported latencies measure the throttling, not
+# your target — which is why Hera refuses to start below 1000m unless
+# HERA_ALLOW_CONSTRAINED=1. To enable it meaningfully:
+#
+#   1. Give the pod Guaranteed QoS (requests == limits) so it is neither
+#      throttled nor preempted unpredictably:
+#        resources:
+#          requests: { cpu: "2", memory: "2Gi", ephemeral-storage: "512Mi" }
+#          limits:   { cpu: "2", memory: "2Gi", ephemeral-storage: "512Mi" }
+#   2. env: HERA_ENABLED=1, HERA_MAX_VUS=50, and HERA_TARGET_ALLOW set to the
+#      hosts you actually intend to load-test. Leaving HERA_TARGET_ALLOW unset
+#      keeps Hera pointed at this instance's own /mock API and nothing else.
+#   3. Add the NetworkPolicy below. The app-level allow-list is a usability
+#      guard; egress policy is the actual blast-radius control, because an
+#      app-level check is one bug away from failing open.
+#
+# A DEDICATED hera Deployment or Job — so load generation never contends with
+# the API — needs a second process writing the results database, which the
+# ReadWriteOnce SQLite PVC forbids. It is blocked on the same Postgres migration
+# as the HPA above.
+# ---
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: hermes-egress
+# spec:
+#   podSelector: { matchLabels: { app: hermes } }
+#   policyTypes: ["Egress"]
+#   egress:
+#     - to: [{ namespaceSelector: {}, podSelector: { matchLabels: { k8s-app: kube-dns } } }]
+#       ports: [{ protocol: UDP, port: 53 }]
+#     - to:
+#         - ipBlock:
+#             cidr: 0.0.0.0/0
+#             except:
+#               - 169.254.0.0/16   # cloud instance metadata (IMDS) — credential theft
+#               - 10.0.0.0/8       # your internal networks
+#               - 172.16.0.0/12
+#               - 192.168.0.0/16
