@@ -25,6 +25,7 @@ Everything in the app, explained in the order you'll meet it. For setup and arch
 15. [Script API reference](#15-script-api-reference)
 16. [Troubleshooting](#16-troubleshooting)
 17. [Backend engine (Node ⇄ Go)](#17-backend-engine-node--go)
+18. [Load testing with Hera](#18-load-testing-with-hera)
 
 ---
 
@@ -350,3 +351,115 @@ Both read the **same database and the same session secret**, so switching engine
 - If a card's dot is red, that backend isn't running — start it (`cd backend-go && go run .` for Go) or ask an admin.
 
 Why two? It lets you A/B the same suites and data across two implementations — handy for comparing behavior, performance, or migrating. Script results and error messages are identical on both, by design.
+
+## 18. Load testing with Hera
+
+Everything so far runs your suite **once, one request at a time**. Hera runs it
+**concurrently**: every virtual user (VU) walks all enabled steps in order,
+carrying captures between them, then loops for the duration you set. Your
+existing suite *is* the load test — there is nothing new to author.
+
+> **What Hera tells you, and what it does not.**
+> Hera answers *"does this break when N users hit it at once?"* — session
+> collisions, race conditions, 429s and 5xxs that never appear at 1 user.
+> It is **not** a capacity-planning latency benchmark. k6 timestamps requests in
+> userspace, so if the machine running Hermes is busy, k6's own scheduling
+> stalls get attributed to your target. For numbers you would put in a capacity
+> plan, run k6 on a dedicated box.
+
+### Starting a run
+
+**Hera → New load test.** Pick a suite, set **virtual users** and **duration**,
+press start. From the suite editor there is also a **⚡ Load test** button, which
+saves first and jumps here with that suite selected.
+
+The caps under each field (`max 20`, `max 60s`) are this server's limits. Ask for
+more and the server reduces it rather than refusing — the run then reports what
+it actually used.
+
+**Thresholds** (under *Advanced*) decide the verdict. With none set, a test that
+finishes is reported **passed** however slow it was — only a k6 failure or a
+broken script fails it. Set a p95 or an error-rate threshold to get a real
+pass/fail.
+
+**Targets** shows exactly where the load will go, resolved from your variables.
+Hosts are pinned to a resolved IP before the run starts, so a DNS change
+mid-run cannot redirect your load somewhere else.
+
+### What Hera can point at
+
+**By default, only this instance's own `/mock` API.** That is not a crippled
+default — `/mock` has a login → token → items chain and `/mock/job` for async
+polling, so you can try the whole thing safely. To load-test anything real, an
+operator sets `HERA_TARGET_ALLOW`.
+
+Permanently blocked, and no configuration can widen this: cloud metadata
+endpoints (`169.254.0.0/16` and friends), IPv6 link-local and unique-local
+addresses, and non-`http(s)` schemes. Pointing Hera at Hermes' own `/api` is
+refused too — hammering the API you are reading results from takes the UI down
+with it.
+
+### Reading the results
+
+| Panel | What it means |
+|---|---|
+| **Requests / Error rate / Requests-s** | totals for the whole run |
+| **p95 / p99** | response-time percentiles across every request |
+| **Checks** | your assertions and `test()` calls — `400/400` means all passed |
+| **Script errors** | a capture/validation script threw. **Any non-zero value fails the run** |
+| **Latency percentiles** chart | ⚠️ **cumulative** — see below |
+| **Throughput / Virtual users / Error rate** charts | instantaneous, from the change between samples |
+| **Per step** | requests, error rate and latency for each step; plus **Polls** and **Wait p95** for polled steps |
+
+The latency chart is **cumulative over the run so far**, because k6 reports a
+running trend that cannot be un-averaged. A spike at second 50 is therefore
+diluted rather than sharp. p99 appears only in the final summary. Throughput,
+VUs and error rate *are* instantaneous.
+
+**Wait p95** is the number to care about for an async pipeline: it is
+time-to-completion — how long a caller waited for the work to actually finish
+under this load — not per-request latency.
+
+### How your scripts behave under load
+
+Capture and validation scripts run **unchanged**. `response`, `variables`,
+`expect`, `test`, `fail` and `stop` all work exactly as in §14. Three
+differences, which preflight also lists before you launch:
+
+1. **`variables.set(..., 'global')` becomes iteration-local.** Under load there
+   is no shared store to write back to, and thousands of VUs writing one global
+   would be meaningless. Chaining *within* each iteration — the part that
+   matters — works normally. The summary counts suppressed global writes.
+2. **`console.log` only emits for the first iteration of the first VU.**
+   Otherwise a long run buries the real errors in noise. You still get one full
+   trace.
+3. **No 2-second per-script timeout.** A runaway script blocks its own virtual
+   user until the run's overall watchdog fires.
+
+### Polling under load
+
+A polled step (§5) keeps polling under load — that *is* the user journey for an
+async API. Two consequences worth planning for:
+
+- **The request count becomes unbounded.** The rate cap and the duration become
+  the real limits, so the "≈ N requests" estimate is replaced by a warning.
+- **Expect few completed iterations.** A step that polls for 60 s means each VU
+  finishes roughly one journey a minute, so a 30 s run may complete none.
+
+### One at a time, and stopping
+
+Only **one load test runs at a time** across the whole installation — both
+backends share a database, so results stay comparable and the machine is not
+fighting itself. Starting a second returns a clear "already running".
+
+**Stop** asks k6 to stop; in-flight virtual users drain first, so the status
+shows `stopping` briefly before it settles on `stopped`. Every role can stop a
+run, including read-only npc.
+
+### When Hera is unavailable
+
+The page says so, with the reason. Hera needs the **k6 binary on the host running
+the selected backend** — so the answer can differ between the Node and Go
+engines, and switching engine may be all it takes. `↻ Recheck` re-probes without
+a restart. A run is also refused on a machine with too little CPU to produce
+honest numbers.

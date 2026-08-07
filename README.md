@@ -42,6 +42,7 @@ cd backend-go && go run .   # API on http://localhost:4001
 | **Validation** | Visual assertion rules + sandboxed `test()`/`expect()` scripts; per-assertion results in every run |
 | **Variables** | Global + suite scopes with Postman-style precedence; secret masking; undefined `{{placeholders}}` flagged inline with one-click "define as global" |
 | **Runs** | 1–100 cycles, stop-on-failure, live progress, full per-step request/response/assertion/capture/log detail |
+| **Load testing (Hera)** | Run any suite under concurrency with the real **k6** binary: every virtual user walks all enabled steps in order, carrying captures between them. Capture/validation scripts run unchanged, polling is measured as time-to-completion, and targets are default-deny |
 | **Single-step Send** | Run one request ad-hoc with unsaved edits; captures fold back so you can test a chain step by step |
 | **Suite composer** | Draggable basket: collect requests across suites → create a new suite from them (referenced variables carried over) |
 | **Export** | Any suite → Postman collection v2.1 (re-importable here or in Postman); visual rules become `pm.test` scripts |
@@ -77,7 +78,11 @@ Each user has one of three roles (set when an admin creates them; existing users
 | Run / execute suites (incl. single-step Send) | ✓ | ✓ | ✓ |
 | Appearance page | ✓ | ✓ | — |
 | Docs | ✓ | ✓ | — |
+| Start a Hera load test | ✓ | opt-in¹ | — |
+| Stop a running load test | ✓ | ✓ | ✓ |
 | Manage users · switch backend engine | ✓ | — | — |
+
+¹ Moderators can launch only when `HERA_ALLOW_MODERATOR=1`. Stopping is open to every role on purpose — anyone who can see a load test running should be able to hit the brakes.
 
 ## Architecture
 
@@ -123,6 +128,7 @@ Hermes/
 - **Storage**: SQLite via Node's built-in `node:sqlite` — zero native dependencies. Data lives in `backend/data/` (`DATA_DIR` to relocate); uploaded files for requests live in `DATA_DIR/files/`.
 - **Scripts** run server-side in a `node:vm` sandbox (2 s timeout, no fs/network). For hostile multi-tenant input, swap `runner/sandbox.ts` for an `isolated-vm` implementation — the interface is designed for that.
 - **Requests** are sent from the backend (axios), so browser CORS never interferes with testing.
+- **Load testing (Hera)** shells out to the real **k6** binary rather than reimplementing a load generator. The suite is compiled to a k6 script fed in on stdin, so it never touches disk; capture/validation scripts run verbatim on a shim over k6 primitives. The `zero native dependencies` note above still holds — k6 is a sibling process, not a linked module — but the published Docker images do bundle a pinned third-party binary (build `--target runtime-slim` for images without it).
 
 ## Backend environment variables
 
@@ -133,6 +139,13 @@ Hermes/
 | `ADMIN_USER` / `ADMIN_PASSWORD` | `admin` / `admin123` | Bootstrap admin (first run only) |
 | `JWT_SECRET` | auto-generated, persisted | Session signing key — **set the same value on both backends** so sessions are interchangeable |
 | `CAPTCHA_BYPASS` | off | `1` accepts captcha text `bypass` — dev/test only, **never in production** |
+| `HERA_ENABLED` | `1` (`0` in k8s) | Turn load testing off entirely |
+| `HERA_TARGET_ALLOW` | *(empty)* | Hosts Hera may target — exact, `*.suffix`, `host:port` or CIDR. **Empty means this instance's own `/mock` API and nothing else** |
+| `HERA_MAX_VUS` | `20` (ceiling 100) | Virtual-user cap; requests above it are reduced, not rejected |
+| `HERA_MAX_DURATION_SEC` | `60` (ceiling 300) | Run-length cap |
+| `HERA_MAX_RPS` | `200` (ceiling 1000) | Always passed to k6 as `--rps`; VU count alone is not a throughput bound |
+| `HERA_ALLOW_MODERATOR` | off | `1` lets moderators start load tests, not just admins |
+| `HERA_K6_BIN` | *(PATH)* | Explicit path to the k6 binary |
 
 The **Go backend** reads the same variables (`PORT` defaults to `4001`, `DATA_DIR` defaults to the sibling `backend/data`, plus `DOCS_DIR` for the Docs page). Point both at the same `DATA_DIR` and give them the same `JWT_SECRET` for a seamless toggle.
 
@@ -141,6 +154,8 @@ The **Go backend** reads the same variables (`PORT` defaults to `4001`, `DATA_DI
 - ✅ Import/export, suite building & editing, step search, chaining, script capture/validation, variables, file uploads (form-data + file store), runs & cycles, report stub, auth + captcha, legends, theming, composer, single-step send, in-app docs.
 - ✅ Docker image, docker-compose, Kubernetes manifests (see [HOW-TO-DEPLOY.md](HOW-TO-DEPLOY.md)).
 - ✅ Parallel **Go backend** with a live UI engine toggle; three-tier **roles** (admin/moderator/npc) enforced on both backends.
+- ✅ **Hera** — k6-backed load testing on both backends, with live charts, per-step breakdown and default-deny targeting.
 - ⏳ SQLite → Postgres data layer for multi-replica horizontal scaling.
+- ⏳ Hera on Kubernetes (needs the Postgres migration, so load generation can run outside the API pod).
 - ⏳ Real report rendering (HTML/PDF) behind the existing stub.
 - ⏳ Executing imported Postman `pm.*` scripts in a compatible sandbox.
