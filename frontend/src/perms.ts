@@ -18,6 +18,14 @@ export interface Perms {
   canViewDocs: boolean;
   canAppearance: boolean;
   canSwitchEngine: boolean;
+  /**
+   * Start a Hera load test. Deliberately NOT canExecute: that is true for npc,
+   * which is right for one functional run and wrong for 20 concurrent VUs.
+   * The server gates this independently (admin, or moderator when
+   * HERA_ALLOW_MODERATOR=1) and reports the truth via /api/hera/capabilities —
+   * this flag only decides whether the UI is worth showing.
+   */
+  canLoadTest: boolean;
 }
 
 export function permsFor(role: Role | undefined, isAdmin?: boolean): Perms {
@@ -36,6 +44,7 @@ export function permsFor(role: Role | undefined, isAdmin?: boolean): Perms {
     canViewDocs: admin || mod,
     canAppearance: admin || mod,
     canSwitchEngine: admin,
+    canLoadTest: admin || mod,
   };
 }
 

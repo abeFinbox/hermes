@@ -236,7 +236,7 @@ details.step-res .detail-body { border-top: 1px solid var(--border); padding: 10
 .token-row input[type='color'] { width: 34px; height: 26px; padding: 1px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); cursor: pointer; flex-shrink: 0; }
 
 /* gentle transition when switching themes */
-body, .sidebar, .topbar, .card, .btn, .step-item, .theme-card, table.list td, table.list th {
+body, .sidebar, .topbar, .card, .btn, .step-item, .theme-card, table.list td, table.list th, .hera-stat, .hera-notice {
   transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
@@ -359,3 +359,112 @@ body, .sidebar, .topbar, .card, .btn, .step-item, .theme-card, table.list td, ta
 .body-viewer-toolbar { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
 pre.body-view.large { max-height: 60vh; min-height: 140px; resize: vertical; }
 pre.body-view.nowrap { white-space: pre; word-break: normal; }
+
+/* ---------- Hera: load-test statuses, stats, charts, launch form ---------- */
+/* Chip classes are derived from data (`chip status-${status}`), so every status
+   the backend can emit needs a rule here or it renders unstyled. */
+.chip.status-queued   { background: var(--surface-2); color: var(--muted); }
+.chip.status-ramping  { background: color-mix(in srgb, var(--info) 18%, var(--surface)); color: var(--info); }
+.chip.status-stopping { background: color-mix(in srgb, var(--warning) 18%, var(--surface)); color: var(--warning); }
+.chip.status-interrupted { background: color-mix(in srgb, var(--danger) 14%, var(--surface)); color: var(--danger); }
+.chip.status-breached { background: color-mix(in srgb, var(--danger) 16%, var(--surface)); color: var(--danger); }
+.chip.external { background: color-mix(in srgb, var(--danger) 16%, var(--surface)); color: var(--danger); }
+
+.hera-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.hera-stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+.hera-stat .k { font-size: 11px; color: var(--muted); }
+.hera-stat .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.hera-stat .s { font-size: 11px; color: var(--muted); }
+.hera-stat.breach { border-color: var(--danger); }
+.hera-stat.breach .v { color: var(--danger); }
+
+.hera-notice {
+  border: 1px solid color-mix(in srgb, var(--warning) 30%, var(--border));
+  background: color-mix(in srgb, var(--warning) 12%, var(--surface));
+  border-radius: var(--radius); padding: 10px 12px; margin-bottom: 12px; font-size: 12px;
+}
+.hera-notice.error {
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+}
+.hera-notice.info {
+  border-color: color-mix(in srgb, var(--info) 30%, var(--border));
+  background: color-mix(in srgb, var(--info) 12%, var(--surface));
+}
+
+.hera-progress { height: 6px; background: var(--surface-2); border-radius: 999px; overflow: hidden; }
+.hera-progress > div { height: 100%; background: var(--primary); transition: width 0.4s linear; }
+.hera-progress.draining > div { background: var(--muted); }
+
+.hera-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 0 18px; }
+.hera-targets { font-family: var(--mono); font-size: 12px; }
+.hera-targets .unresolved { color: var(--danger); }
+
+table.list td.num, table.list th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.hera-row-breach td:first-child { border-left: 3px solid var(--danger); }
+
+@media (prefers-reduced-motion: reduce) { .hera-progress > div { transition: none; } }
+@media (max-width: 820px) { .hera-stats { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); } }
+
+/* ---------- Hera: hand-rolled SVG charts ----------
+   Tone is a CSS class, never a JS-computed colour: applyTheme() is the only
+   writer of these variables, so reading computed styles in JS would break the
+   Appearance page's live preview. Every rule below therefore resolves through
+   var(), which also means user-authored custom themes work for free. */
+.hera-chart { position: relative; padding-left: 46px; }
+.hera-chart svg.chart { display: block; width: 100%; }
+.hera-chart svg.chart:focus-visible { outline: 2px solid color-mix(in srgb, var(--primary) 35%, transparent); }
+
+.chart-grid { stroke: var(--border); stroke-width: 1; }
+.chart-line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart-line.tone-primary { stroke: var(--primary); }
+.chart-line.tone-info    { stroke: var(--info); }
+.chart-line.tone-success { stroke: var(--success); }
+.chart-line.tone-warning { stroke: var(--warning); }
+.chart-line.tone-danger  { stroke: var(--danger); }
+.chart-line.tone-muted   { stroke: var(--muted); }
+
+/* 14% matches .spark-fill, already proven across all 8 presets by the topbar. */
+.chart-area { stroke: none; }
+.chart-area.tone-primary { fill: color-mix(in srgb, var(--primary) 14%, transparent); }
+.chart-area.tone-info    { fill: color-mix(in srgb, var(--info) 14%, transparent); }
+.chart-area.tone-danger  { fill: color-mix(in srgb, var(--danger) 14%, transparent); }
+.chart-area.tone-warning { fill: color-mix(in srgb, var(--warning) 14%, transparent); }
+.chart-area.tone-success { fill: color-mix(in srgb, var(--success) 14%, transparent); }
+.chart-area.tone-muted   { fill: color-mix(in srgb, var(--muted) 14%, transparent); }
+
+.chart-threshold { stroke: var(--danger); stroke-width: 1.5; stroke-dasharray: 6 4; }
+.chart-cursor { stroke: color-mix(in srgb, var(--text) 40%, transparent); stroke-width: 1; }
+.chart-hit { fill: transparent; cursor: crosshair; }
+
+.hera-axis-y {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 42px;
+  display: flex; flex-direction: column; justify-content: space-between;
+  font-size: 11px; color: var(--muted); text-align: right; pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
+.hera-axis-x {
+  display: flex; justify-content: space-between; font-size: 11px;
+  color: var(--muted); margin: 2px 0 0 46px; font-variant-numeric: tabular-nums;
+}
+.hera-readout {
+  display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px;
+  font-variant-numeric: tabular-nums; margin: 6px 0 0 46px; min-height: 18px;
+}
+.hera-chart-empty { display: flex; align-items: center; justify-content: center; color: var(--muted); }
+
+.chart-swatch {
+  display: inline-block; width: 14px; height: 3px; border-radius: 2px;
+  margin-right: 5px; vertical-align: middle;
+}
+.chart-swatch.tone-primary { background: var(--primary); }
+.chart-swatch.tone-info    { background: var(--info); }
+.chart-swatch.tone-success { background: var(--success); }
+.chart-swatch.tone-warning { background: var(--warning); }
+.chart-swatch.tone-danger  { background: var(--danger); }
+.chart-swatch.tone-muted   { background: var(--muted); }
+.chart-swatch.dashed { background-image: repeating-linear-gradient(90deg, transparent 0 3px, var(--surface) 3px 5px); }
+
+.hera-bar { background: var(--surface-2); border-radius: 999px; height: 10px; overflow: hidden; }
+.hera-bar .fill { height: 100%; background: var(--primary); }
+.hera-bar .fill.breach { background: var(--danger); }

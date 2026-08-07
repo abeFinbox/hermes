@@ -157,6 +157,12 @@ export default function SuiteEditor() {
     }
   };
 
+  /** Hand off to Hera with this suite preselected. Saves first, like run(). */
+  const loadTest = async () => {
+    if (dirty) await save();
+    navigate(`/hera?suiteId=${id}`);
+  };
+
   const run = async () => {
     setRunning(true);
     try {
@@ -245,6 +251,14 @@ export default function SuiteEditor() {
         <button className="btn primary" disabled={running} onClick={() => void run()}>
           {running ? 'Starting…' : '▶ Run'}
         </button>
+        {perms.canLoadTest && (
+          <>
+            <button className="btn" disabled={running}
+              title="Load-test this suite with Hera — same steps, run concurrently"
+              onClick={() => void loadTest()}>⚡ Load test</button>
+            <Info k="suite.loadTest" />
+          </>
+        )}
       </div>
 
       {/* suite-level tabs */}

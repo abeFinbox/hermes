@@ -13,6 +13,8 @@ import Variables from './pages/Variables';
 import Files from './pages/Files';
 import Runs from './pages/Runs';
 import RunDetail from './pages/RunDetail';
+import Hera from './pages/Hera';
+import HeraDetail from './pages/HeraDetail';
 import Settings from './pages/Settings';
 import Docs from './pages/Docs';
 import TopbarMetrics from './components/TopbarMetrics';
@@ -74,6 +76,7 @@ function Shell() {
           <NavLink to="/variables">Variables<Info k="nav.variables" /></NavLink>
           <NavLink to="/files">Files<Info k="nav.files" /></NavLink>
           <NavLink to="/runs">Runs<Info k="nav.runs" /></NavLink>
+          {perms.canLoadTest && <NavLink to="/hera">Hera<Info k="nav.hera" /></NavLink>}
           {perms.canAppearance && <NavLink to="/appearance">Appearance<Info k="nav.appearance" /></NavLink>}
           <NavLink to="/settings">Settings<Info k="nav.settings" /></NavLink>
           {perms.canViewDocs && <NavLink to="/docs">Docs<Info k="nav.docs" /></NavLink>}
@@ -110,6 +113,8 @@ function Shell() {
             <Route path="/files" element={<Files />} />
             <Route path="/runs" element={<Runs />} />
             <Route path="/runs/:id" element={<RunDetail />} />
+            <Route path="/hera" element={perms.canLoadTest ? <Hera /> : <Navigate to="/suites" replace />} />
+            <Route path="/hera/:id" element={perms.canLoadTest ? <HeraDetail /> : <Navigate to="/suites" replace />} />
             <Route path="/appearance" element={perms.canAppearance ? <Appearance /> : <Navigate to="/suites" replace />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/docs" element={perms.canViewDocs ? <Docs /> : <Navigate to="/suites" replace />} />
