@@ -277,6 +277,7 @@ func runsRouter() chi.Router {
 	r := chi.NewRouter()
 	r.Post("/", triggerRun)
 	r.Post("/step", runStep)
+	r.Post("/try-script", tryScript)
 	r.Post("/{id}/stop", stopRunHandler)
 	r.Get("/", listRuns)
 	r.Get("/{id}", getRun)
@@ -294,12 +295,15 @@ func rowToRun(scan func(...interface{}) error, includeResults bool) (*model.Run,
 		cycleJSON                                 string
 		summaryJSON                               *string
 	)
-	if err := scan(&id, &suiteID, &suiteName, &status, &cycles, &stopOnFailure, &startedAt, &finishedAt, &cycleJSON, &summaryJSON); err != nil {
+	var envID *string
+	var envName string
+	if err := scan(&id, &suiteID, &suiteName, &status, &cycles, &stopOnFailure, &startedAt, &finishedAt, &cycleJSON, &summaryJSON, &envID, &envName); err != nil {
 		return nil, err
 	}
 	run := &model.Run{
 		ID: id, SuiteID: suiteID, SuiteName: suiteName, Status: status, Cycles: cycles,
-		StopOnFailure: stopOnFailure != 0, StartedAt: startedAt, FinishedAt: finishedAt,
+		StopOnFailure: stopOnFailure != 0, EnvID: envID, EnvName: envName,
+		StartedAt: startedAt, FinishedAt: finishedAt,
 		CycleResults: []model.CycleResult{},
 	}
 	if includeResults {
@@ -317,18 +321,26 @@ func rowToRun(scan func(...interface{}) error, includeResults bool) (*model.Run,
 	return run, nil
 }
 
-const runCols = "id, suite_id, suite_name, status, cycles, stop_on_failure, started_at, finished_at, cycle_results_json, summary_json"
+const runCols = "id, suite_id, suite_name, status, cycles, stop_on_failure, started_at, finished_at, cycle_results_json, summary_json, env_id, env_name"
 
 func triggerRun(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SuiteID       string `json:"suiteId"`
 		Cycles        *int   `json:"cycles"`
 		StopOnFailure *bool  `json:"stopOnFailure"`
+		// Raw so absent (use the suite default) stays distinct from null (no
+		// environment) — see resolveEnvID.
+		EnvID json.RawMessage `json:"envId"`
 	}
 	_ = web.Decode(r, &body)
 	suite, _ := getSuite(body.SuiteID)
 	if suite == nil {
 		web.Err(w, 404, "Suite not found")
+		return
+	}
+	envID := resolveEnvID(body.EnvID, suite.DefaultEnvID)
+	if envID != "" && store.GetEnvironment(envID) == nil {
+		web.Err(w, 404, "Environment not found")
 		return
 	}
 	anyEnabled := false
@@ -356,8 +368,10 @@ func triggerRun(w http.ResponseWriter, r *http.Request) {
 	if body.StopOnFailure != nil {
 		stop = *body.StopOnFailure
 	}
-	run := runner.StartRun(*suite, n, stop)
-	web.JSON(w, 202, map[string]string{"id": run.ID, "status": run.Status})
+	run := runner.StartRun(*suite, n, stop, envID)
+	web.JSON(w, 202, map[string]interface{}{
+		"id": run.ID, "status": run.Status, "envId": run.EnvID, "envName": run.EnvName,
+	})
 }
 
 func runStep(w http.ResponseWriter, r *http.Request) {
@@ -365,6 +379,7 @@ func runStep(w http.ResponseWriter, r *http.Request) {
 		Step           *model.Step            `json:"step"`
 		SuiteVariables []model.SuiteVariable  `json:"suiteVariables"`
 		Settings       map[string]interface{} `json:"settings"`
+		EnvID          string                 `json:"envId"`
 	}
 	if err := web.Decode(r, &body); err != nil || body.Step == nil {
 		web.Err(w, 400, "A step object with a request is required")
@@ -380,9 +395,39 @@ func runStep(w http.ResponseWriter, r *http.Request) {
 		vars = []model.SuiteVariable{}
 	}
 	suite := model.Suite{ID: "ad-hoc", Name: "ad-hoc", Steps: []model.Step{*body.Step}, Variables: vars, Settings: settings}
-	scope := runner.NewVarScope(suite)
+	scope := runner.NewVarScopeEnv(suite, body.EnvID)
 	result := runner.ExecuteStep(*body.Step, scope, suite, runner.ExecuteOpts{WithCurl: true, FullBody: true})
 	web.JSON(w, 200, result)
+}
+
+/*
+tryScript dry-runs a validation / capture / poll-stop script against a
+HAND-WRITTEN response. Port of POST /api/runs/try-script in
+backend/src/routes/runs.ts.
+
+No HTTP request is made and nothing is persisted — not even a global-scope
+capture (see runner.RunScriptBench). Listed in the execute whitelist in
+auth.go, so read-only npc can use it: it is strictly less powerful than the
+"Send" they already have.
+*/
+func tryScript(w http.ResponseWriter, r *http.Request) {
+	var body runner.ScriptBenchInput
+	if err := web.Decode(r, &body); err != nil {
+		web.Err(w, 400, "Invalid request body")
+		return
+	}
+	if body.Mode != "validate" && body.Mode != "capture" && body.Mode != "poll" {
+		web.Err(w, 400, "mode must be one of 'validate', 'capture', 'poll'")
+		return
+	}
+	if body.EnvID != "" && store.GetEnvironment(body.EnvID) == nil {
+		web.Err(w, 404, "Environment not found")
+		return
+	}
+	if body.SuiteVariables == nil {
+		body.SuiteVariables = []model.SuiteVariable{}
+	}
+	web.JSON(w, 200, runner.RunScriptBench(body))
 }
 
 func stopRunHandler(w http.ResponseWriter, r *http.Request) {

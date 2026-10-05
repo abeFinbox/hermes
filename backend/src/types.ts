@@ -101,6 +101,8 @@ export interface Suite {
   steps: Step[];
   variables: SuiteVariable[];
   settings: SuiteSettings;
+  /** Environment pre-selected for runs of this suite; null = none. */
+  defaultEnvId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -109,6 +111,26 @@ export interface GlobalVariable {
   key: string;
   value: string;
   secret: boolean;
+}
+
+/** One variable inside an environment — same shape as a global/suite variable. */
+export interface EnvironmentVariable {
+  key: string;
+  value: string;
+  secret: boolean;
+}
+
+/**
+ * A named, reusable variable set (dev, staging, custom...). The most specific
+ * layer below runtime captures: runtime > environment > global > suite.
+ */
+export interface Environment {
+  id: string;
+  name: string;
+  description: string;
+  variables: EnvironmentVariable[];
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AssertionResult {
@@ -172,6 +194,10 @@ export interface Run {
   status: 'running' | 'passed' | 'failed' | 'error' | 'stopped';
   cycles: number;
   stopOnFailure: boolean;
+  /** Environment this run resolved variables against (null = globals + suite only). */
+  envId: string | null;
+  /** Name at launch time — kept so a renamed or deleted environment stays readable. */
+  envName: string;
   startedAt: string;
   finishedAt: string | null;
   cycleResults: CycleResult[];

@@ -3,6 +3,7 @@ import type { Assertion, AssertionType, CaptureRule, FormDataField, GlobalVariab
 import { newId, defaultPolling } from '../types';
 import { api } from '../api';
 import { Info } from '../legends';
+import { useToast } from '../ui';
 import { formatBytes } from '../pages/Files';
 import KVEditor from './KVEditor';
 import VarChips from './VarChips';
@@ -21,23 +22,37 @@ interface TabProps {
 
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
 
+/**
+ * Method + URL + the placeholder chips.
+ *
+ * Split out of RequestTab so the editor can PIN it above the scrolling part of
+ * the step panel: the URL is the thing you check while editing anything else,
+ * and it stays visible on the Validate / Capture / Poll tabs too.
+ */
+export function RequestUrlRow({ step, stepIndex, steps, suiteVars, globals, onChange, onGlobalsChanged }: TabProps) {
+  const req = step.request;
+  return (
+    <>
+      <div className="row mb">
+        <select style={{ width: 110 }} value={req.method} onChange={(e) => onChange({ request: { ...req, method: e.target.value } })}>
+          {METHODS.map((m) => <option key={m}>{m}</option>)}
+        </select>
+        <input className="grow mono" type="text" placeholder="https://api.example.com/path or {{baseUrl}}/path"
+          value={req.url} onChange={(e) => onChange({ request: { ...req, url: e.target.value } })} />
+      </div>
+      <VarChips step={step} stepIndex={stepIndex} steps={steps} suiteVars={suiteVars} globals={globals} onGlobalsChanged={onGlobalsChanged} />
+    </>
+  );
+}
+
 export function RequestTab({ step, stepIndex, steps, suiteVars, globals, onChange, onGlobalsChanged }: TabProps) {
+  const toast = useToast();
   const req = step.request;
   const setReq = (patch: Partial<Step['request']>) => onChange({ request: { ...req, ...patch } });
 
   return (
     <div>
-      <div className="row mb">
-        <select style={{ width: 110 }} value={req.method} onChange={(e) => setReq({ method: e.target.value })}>
-          {METHODS.map((m) => <option key={m}>{m}</option>)}
-        </select>
-        <input className="grow mono" type="text" placeholder="https://api.example.com/path or {{baseUrl}}/path"
-          value={req.url} onChange={(e) => setReq({ url: e.target.value })} />
-      </div>
-
-      <VarChips step={step} stepIndex={stepIndex} steps={steps} suiteVars={suiteVars} globals={globals} onGlobalsChanged={onGlobalsChanged} />
-
-      <h3 className="mt">Query params</h3>
+      <h3 style={{ marginTop: 0 }}>Query params</h3>
       <KVEditor items={req.params} onChange={(params) => setReq({ params })} keyPlaceholder="param" />
 
       <h3 className="mt">Headers</h3>
@@ -66,7 +81,35 @@ export function RequestTab({ step, stepIndex, steps, suiteVars, globals, onChang
         </label>
       )}
       {(req.body.mode === 'json' || req.body.mode === 'raw' || req.body.mode === 'form') && (
-        <textarea className="code" rows={8} value={req.body.content} onChange={(e) => setReq({ body: { ...req.body, content: e.target.value } })} />
+        <>
+          {(req.body.mode === 'json' || req.body.mode === 'raw') && (
+            <div className="row mb">
+              <button className="btn small" title="Re-indent this payload as JSON — {{tokens}} are preserved"
+                onClick={() => {
+                  const res = beautifyJson(req.body.content || '');
+                  if (!res.ok) return toast(`Not valid JSON: ${res.error}`, 'error');
+                  if (res.text === req.body.content) return toast('Already formatted');
+                  setReq({ body: { ...req.body, content: res.text } });
+                  toast('Payload beautified');
+                }}>
+                ✨ Beautify
+              </button>
+              <button className="btn small" title="Collapse this payload onto one line — {{tokens}} are preserved"
+                onClick={() => {
+                  const res = minifyJson(req.body.content || '');
+                  if (!res.ok) return toast(`Not valid JSON: ${res.error}`, 'error');
+                  if (res.text === req.body.content) return toast('Already minified');
+                  setReq({ body: { ...req.body, content: res.text } });
+                  toast('Payload minified');
+                }}>
+                🗜 Minify
+              </button>
+              <Info k="body.beautify" />
+              <span className="muted" style={{ fontSize: 11 }}>{'{{tokens}}'} kept as-is</span>
+            </div>
+          )}
+          <textarea className="code" rows={8} value={req.body.content} onChange={(e) => setReq({ body: { ...req.body, content: e.target.value } })} />
+        </>
       )}
       {req.body.mode === 'form-data' && (
         <FormDataEditor fields={req.body.formData ?? []} onChange={(formData) => setReq({ body: { ...req.body, formData } })} />
@@ -107,6 +150,88 @@ export function RequestTab({ step, stepIndex, steps, suiteVars, globals, onChang
       )}
     </div>
   );
+}
+
+
+// ---------------- payload beautifier ----------------
+
+/**
+ * Pretty-print a JSON payload that may be full of {{tokens}}.
+ *
+ * A bare token as a value (`"amount": {{amount}}`) is not valid JSON, so parsing
+ * the body as-is would fail on exactly the payloads this app produces. Each
+ * token is therefore swapped for a placeholder STRING before parsing and put
+ * back verbatim afterwards — including its original quoting, so
+ * `"id": "{{x}}"` stays quoted and `"n": {{x}}` stays bare.
+ */
+/**
+ * Re-format a JSON payload that may be full of {{tokens}}.
+ *
+ * `indent` is the JSON.stringify indent: 2 to beautify, 0 to collapse onto one
+ * line. Both directions need the same trick, which is why they share a body.
+ */
+function formatJson(text: string, indent: number): { ok: true; text: string } | { ok: false; error: string } {
+  const TOKEN = /\{\{\s*[^}\s]+\s*\}\}/g;
+  const ph = (i: number) => `__HERMES_TOKEN_${i}__`;
+  const tokens: Array<{ raw: string; addedQuotes: boolean }> = [];
+
+  // Scan rather than blanket-replace: whether a token needs quotes added
+  // depends on whether it already sits inside a string. `"{{a}}/x"` must keep
+  // the quotes it has (adding more makes `""..."`, which is not JSON), while a
+  // bare `"n": {{a}}` needs a quoted stand-in to parse at all.
+  let masked = '';
+  let i = 0;
+  let inString = false;
+  while (i < text.length) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') { masked += text.slice(i, i + 2); i += 2; continue; }
+      if (ch === '"') { inString = false; masked += ch; i += 1; continue; }
+    } else if (ch === '"') {
+      inString = true;
+      masked += ch;
+      i += 1;
+      continue;
+    }
+    TOKEN.lastIndex = i;
+    const m = TOKEN.exec(text);
+    if (m && m.index === i) {
+      const id = tokens.length;
+      tokens.push({ raw: m[0], addedQuotes: !inString });
+      masked += inString ? ph(id) : `"${ph(id)}"`;
+      i += m[0].length;
+      continue;
+    }
+    masked += ch;
+    i += 1;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(masked);
+  } catch (e: any) {
+    return { ok: false, error: e?.message || 'invalid JSON' };
+  }
+
+  let out = JSON.stringify(parsed, null, indent);
+  // Each index is used once, so the needles are unambiguous. Stand-ins we
+  // quoted ourselves give their quotes back; ones that were already inside a
+  // string are swapped in place.
+  tokens.forEach((t, id) => {
+    const needle = t.addedQuotes ? `"${ph(id)}"` : ph(id);
+    out = out.split(needle).join(t.raw);
+  });
+  return { ok: true, text: out };
+}
+
+/** Pretty-print with a 2-space indent, preserving {{tokens}}. */
+export function beautifyJson(text: string) {
+  return formatJson(text, 2);
+}
+
+/** Collapse to a single line, preserving {{tokens}} — the undo of Beautify. */
+export function minifyJson(text: string) {
+  return formatJson(text, 0);
 }
 
 // ---------------- form-data (multipart) body editor ----------------

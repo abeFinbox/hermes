@@ -3,6 +3,7 @@ import { db } from '../db.js';
 import { newId, defaultSettings, emptyStep, type Suite } from '../types.js';
 import { exportSuiteAsCollection } from '../postman-export.js';
 import { BundleError, buildBundle, importBundle, parseBundle } from '../suite-bundle.js';
+import { getEnvironment } from './environments.js';
 import type { AuthedRequest } from '../auth.js';
 
 export const suitesRouter = Router();
@@ -16,6 +17,7 @@ function rowToSuite(row: any): Suite {
     steps: JSON.parse(row.steps_json),
     variables: JSON.parse(row.variables_json),
     settings: { ...defaultSettings(), ...JSON.parse(row.settings_json) },
+    defaultEnvId: row.default_env_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -61,17 +63,24 @@ suitesRouter.post('/', (req, res) => {
 suitesRouter.put('/:id', (req, res) => {
   const existing = getSuite(req.params.id);
   if (!existing) return res.status(404).json({ error: 'Suite not found' });
-  const { name, description, steps, variables, settings } = req.body || {};
+  const { name, description, steps, variables, settings, defaultEnvId } = req.body || {};
   if (name !== undefined && !String(name).trim()) return res.status(400).json({ error: 'Suite name cannot be empty' });
   if (steps !== undefined && !Array.isArray(steps)) return res.status(400).json({ error: 'steps must be an array' });
   if (variables !== undefined && !Array.isArray(variables)) return res.status(400).json({ error: 'variables must be an array' });
+  // defaultEnvId: undefined = leave alone, null/'' = clear, id = must exist
+  let nextEnvId = existing.defaultEnvId;
+  if (defaultEnvId !== undefined) {
+    nextEnvId = defaultEnvId ? String(defaultEnvId) : null;
+    if (nextEnvId && !getEnvironment(nextEnvId)) return res.status(404).json({ error: 'Environment not found' });
+  }
 
-  db.prepare('UPDATE suites SET name = ?, description = ?, steps_json = ?, variables_json = ?, settings_json = ?, updated_at = ? WHERE id = ?').run(
+  db.prepare('UPDATE suites SET name = ?, description = ?, steps_json = ?, variables_json = ?, settings_json = ?, default_env_id = ?, updated_at = ? WHERE id = ?').run(
     name !== undefined ? String(name).trim() : existing.name,
     description !== undefined ? String(description) : existing.description,
     JSON.stringify(steps !== undefined ? steps : existing.steps),
     JSON.stringify(variables !== undefined ? variables : existing.variables),
     JSON.stringify(settings !== undefined ? { ...existing.settings, ...settings } : existing.settings),
+    nextEnvId,
     new Date().toISOString(),
     req.params.id,
   );
@@ -137,8 +146,8 @@ suitesRouter.post('/:id/duplicate', (req, res) => {
   const id = newId();
   const now = new Date().toISOString();
   db.prepare(
-    'INSERT INTO suites (id, name, description, collection_id, steps_json, variables_json, settings_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-  ).run(id, `${suite.name} (copy)`, suite.description, suite.collectionId, JSON.stringify(suite.steps), JSON.stringify(suite.variables), JSON.stringify(suite.settings), now, now);
+    'INSERT INTO suites (id, name, description, collection_id, steps_json, variables_json, settings_json, default_env_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run(id, `${suite.name} (copy)`, suite.description, suite.collectionId, JSON.stringify(suite.steps), JSON.stringify(suite.variables), JSON.stringify(suite.settings), suite.defaultEnvId, now, now);
   res.status(201).json(getSuite(id));
 });
 

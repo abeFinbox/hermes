@@ -13,11 +13,13 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/finbox/hermes/backend-go/internal/dynvars"
 	"github.com/finbox/hermes/backend-go/internal/model"
 	"github.com/finbox/hermes/backend-go/internal/store"
 	"github.com/ohler55/ojg/jp"
@@ -44,19 +46,29 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 // ---------- variable resolution ----------
 
-// VarScope resolves {{variables}} with runtime > suite > global precedence,
-// mirroring the TS VarScope.
+// VarScope resolves {{variables}} with runtime > environment > global > suite
+// precedence, mirroring the TS VarScope (see Get for why suite is last).
 type VarScope struct {
 	globalVars   map[string]string
+	envVars      map[string]string
 	suiteVars    map[string]string
 	runtimeVars  map[string]string
 	secretValues map[string]bool // non-empty secret variable values → used to redact curl
 	GlobalsDirty bool
 }
 
+// NewVarScope builds a scope with no environment layer.
 func NewVarScope(suite model.Suite) *VarScope {
+	return NewVarScopeEnv(suite, "")
+}
+
+// NewVarScopeEnv layers one environment's variables over the globals. An empty
+// or unknown envID gives an empty layer, so a deleted environment degrades to
+// "no environment" rather than breaking every run that referenced it.
+func NewVarScopeEnv(suite model.Suite, envID string) *VarScope {
 	vs := &VarScope{
 		globalVars:   map[string]string{},
+		envVars:      map[string]string{},
 		suiteVars:    map[string]string{},
 		runtimeVars:  map[string]string{},
 		secretValues: map[string]bool{},
@@ -69,6 +81,12 @@ func NewVarScope(suite model.Suite) *VarScope {
 			}
 		}
 	}
+	for _, e := range store.GetEnvVars(envID) {
+		vs.envVars[e.Key] = e.Value
+		if e.Secret && e.Value != "" {
+			vs.secretValues[e.Value] = true
+		}
+	}
 	for _, v := range suite.Variables {
 		vs.suiteVars[v.Key] = v.Value
 		if v.Secret && v.Value != "" {
@@ -78,19 +96,48 @@ func NewVarScope(suite model.Suite) *VarScope {
 	return vs
 }
 
+/*
+Get resolves in order: runtime > environment > global > suite.
+
+This deliberately does NOT match Postman, where collection (suite) variables
+outrank the environment and globals. The reason is what suite variables actually
+are here: mostly values carried in by a Postman import — a base_url pointing at
+whatever host the collection was recorded against. With Postman's order those
+imported values silently shadowed the environment, so switching environment
+changed nothing. Suite variables are therefore the FALLBACK layer.
+
+Captures are unaffected: a capture with scope "suite" also writes the runtime
+layer (see Set), which is still the top of the chain.
+*/
 func (vs *VarScope) Get(key string) (string, bool) {
+	// Dynamic variables are generated, not looked up, and are checked FIRST: no
+	// scope can shadow them because a stored variable name can never start with
+	// '$'. Evaluated per call, so two {{$guid}} differ — see package dynvars.
+	if v, ok := dynvars.Value(key); ok {
+		return v, true
+	}
 	if v, ok := vs.runtimeVars[key]; ok {
 		return v, true
 	}
-	if v, ok := vs.suiteVars[key]; ok {
+	if v, ok := vs.envVars[key]; ok {
 		return v, true
 	}
 	if v, ok := vs.globalVars[key]; ok {
 		return v, true
 	}
+	if v, ok := vs.suiteVars[key]; ok {
+		return v, true
+	}
 	return "", false
 }
 
+// Set writes into one scope layer.
+//
+// NOTE on scope "global" while an environment is selected: the write lands in
+// global_variables as asked, but a same-named environment variable still wins on
+// read for the rest of the run (see Get) — the environment is the more specific
+// layer. Capture to suite/runtime scope if the value must be the one that
+// resolves; both also write the runtime layer, which outranks everything.
 func (vs *VarScope) Set(key, value, scope string) {
 	switch scope {
 	case "global":
@@ -257,6 +304,143 @@ func runVisualCapture(c model.CaptureRule, resp SandboxResponse) (string, error)
 		return stringifyValue(v), nil
 	}
 	return "", fmt.Errorf("unknown capture source %s", c.Source)
+}
+
+// ---------- script bench (try a script against a hand-written response) ----------
+//
+// Go port of runScriptBench in backend/src/runner/executor.ts. Dry-runs a
+// validation / capture / poll-stop script against a response the user types in:
+// no HTTP request, and nothing persisted — not even a global-scope capture.
+
+type BenchResponse struct {
+	Status     int               `json:"status"`
+	StatusText string            `json:"statusText"`
+	Headers    map[string]string `json:"headers"`
+	TimeMs     float64           `json:"timeMs"`
+	Body       string            `json:"body"`
+}
+
+type ScriptBenchInput struct {
+	Mode             string                `json:"mode"` // validate | capture | poll
+	Code             string                `json:"code"`
+	VisualAssertions []model.Assertion     `json:"visualAssertions"`
+	VisualCaptures   []model.CaptureRule   `json:"visualCaptures"`
+	Response         BenchResponse         `json:"response"`
+	SuiteVariables   []model.SuiteVariable `json:"suiteVariables"`
+	EnvID            string                `json:"envId"`
+}
+
+type BenchVariable struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type ScriptBenchResult struct {
+	Mode          string                `json:"mode"`
+	Assertions    []model.AssertionResult `json:"assertions"`
+	Captured      []model.CapturedValue   `json:"captured"`
+	Logs          []string                `json:"logs"`
+	StopRequested bool                    `json:"stopRequested"`
+	Failed        bool                    `json:"failed"`
+	Error         string                  `json:"error,omitempty"`
+	UsedVariables []BenchVariable         `json:"usedVariables"`
+}
+
+func RunScriptBench(in ScriptBenchInput) ScriptBenchResult {
+	suite := model.Suite{
+		ID: "bench", Name: "bench", Steps: []model.Step{},
+		Variables: in.SuiteVariables, Settings: model.DefaultSettings(),
+	}
+	if suite.Variables == nil {
+		suite.Variables = []model.SuiteVariable{}
+	}
+	scope := NewVarScopeEnv(suite, in.EnvID)
+
+	status := in.Response.Status
+	if status == 0 {
+		status = 200
+	}
+	statusText := in.Response.StatusText
+	if statusText == "" {
+		statusText = "OK"
+	}
+	headers := map[string]string{}
+	for k, v := range in.Response.Headers {
+		headers[strings.ToLower(k)] = v
+	}
+	resp := SandboxResponse{
+		Status: status, StatusText: statusText, Headers: headers,
+		Time: in.Response.TimeMs, BodyText: in.Response.Body,
+	}
+
+	assertions := []model.AssertionResult{}
+	captured := []model.CapturedValue{}
+	usedKeys := map[string]bool{}
+
+	if in.Mode == "validate" {
+		for _, a := range in.VisualAssertions {
+			assertions = append(assertions, runVisualAssertion(a, resp))
+		}
+	}
+	if in.Mode == "capture" {
+		for _, c := range in.VisualCaptures {
+			value, err := runVisualCapture(c, resp)
+			if err != nil {
+				assertions = append(assertions, model.AssertionResult{
+					Name: "capture " + c.TargetVariable, Passed: false, Message: err.Error(),
+				})
+				continue
+			}
+			// Held in runtime scope even when the rule says "global": a bench run
+			// must not write to global_variables. The REPORTED scope stays the
+			// rule's own, so the reader still sees where a real run would put it.
+			writeScope := c.Scope
+			if writeScope == "global" {
+				writeScope = "runtime"
+			}
+			scope.Set(c.TargetVariable, value, writeScope)
+			captured = append(captured, model.CapturedValue{Key: c.TargetVariable, Value: value, Scope: c.Scope})
+		}
+	}
+
+	outcome := RunScript(in.Code, resp, func(key string) (string, bool) {
+		usedKeys[key] = true
+		return scope.Get(key)
+	}, in.Mode)
+	assertions = append(assertions, outcome.Tests...)
+	// Bench writes are NOT persisted: a global-scope capture here would edit real
+	// global variables from a form the user is only experimenting in.
+	for _, sv := range outcome.SetVariables {
+		captured = append(captured, model.CapturedValue{Key: sv.Key, Value: sv.Value, Scope: sv.Scope})
+	}
+
+	failed := outcome.Failed
+	for _, a := range assertions {
+		if !a.Passed {
+			failed = true
+		}
+	}
+
+	keys := make([]string, 0, len(usedKeys))
+	for k := range usedKeys {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	used := make([]BenchVariable, 0, len(keys))
+	for _, k := range keys {
+		v, _ := scope.Get(k)
+		used = append(used, BenchVariable{Key: k, Value: v})
+	}
+
+	logs := outcome.Logs
+	if logs == nil {
+		logs = []string{}
+	}
+	return ScriptBenchResult{
+		Mode: in.Mode, Assertions: assertions, Captured: captured, Logs: logs,
+		StopRequested: outcome.StopRequested, Failed: failed, Error: outcome.Error,
+		UsedVariables: used,
+	}
 }
 
 // ---------- step execution ----------
@@ -694,10 +878,17 @@ func StopRun(runID string) bool {
 func nowISO() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 // StartRun persists a running Run and kicks off execution in the background.
-func StartRun(suite model.Suite, cycles int, stopOnFailure bool) model.Run {
+// envID selects the environment layer; "" means globals + suite only.
+func StartRun(suite model.Suite, cycles int, stopOnFailure bool, envID string) model.Run {
+	var envPtr *string
+	if envID != "" {
+		id := envID
+		envPtr = &id
+	}
 	run := model.Run{
 		ID: model.NewID(), SuiteID: suite.ID, SuiteName: suite.Name, Status: "running",
-		Cycles: cycles, StopOnFailure: stopOnFailure, StartedAt: nowISO(),
+		Cycles: cycles, StopOnFailure: stopOnFailure,
+		EnvID: envPtr, EnvName: store.EnvNameFor(envID), StartedAt: nowISO(),
 		CycleResults: []model.CycleResult{}, Summary: nil,
 	}
 	persistRun(run)
@@ -714,7 +905,11 @@ func executeRun(run model.Run, suite model.Suite, ctx context.Context) {
 	cancelled := func() bool { return ctx.Err() != nil }
 
 	for cycle := 1; cycle <= run.Cycles && !cancelled(); cycle++ {
-		scope := NewVarScope(suite) // fresh scope per cycle; globals persist across cycles
+		envID := ""
+		if run.EnvID != nil {
+			envID = *run.EnvID
+		}
+		scope := NewVarScopeEnv(suite, envID) // fresh scope per cycle; globals persist across cycles
 		cr := model.CycleResult{Cycle: cycle, Passed: true, Steps: []model.StepResult{}}
 		run.CycleResults = append(run.CycleResults, cr)
 		idx := len(run.CycleResults) - 1
@@ -811,12 +1006,17 @@ func persistRun(run model.Run) {
 	if run.StopOnFailure {
 		stopVal = 1
 	}
+	var envID interface{}
+	if run.EnvID != nil {
+		envID = *run.EnvID
+	}
 	_, _ = store.DB.Exec(
-		`INSERT INTO runs (id, suite_id, suite_name, status, cycles, stop_on_failure, started_at, finished_at, cycle_results_json, summary_json)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO runs (id, suite_id, suite_name, status, cycles, stop_on_failure, env_id, env_name, started_at, finished_at, cycle_results_json, summary_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET status = excluded.status, finished_at = excluded.finished_at,
 		   cycle_results_json = excluded.cycle_results_json, summary_json = excluded.summary_json`,
 		run.ID, run.SuiteID, run.SuiteName, run.Status, run.Cycles, stopVal,
+		envID, run.EnvName,
 		run.StartedAt, finished, string(cycleJSON), summaryJSON,
 	)
 }

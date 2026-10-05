@@ -2,11 +2,13 @@ import { useState } from 'react';
 import { api } from '../api';
 import { Info } from '../legends';
 import { Modal, useToast } from '../ui';
+import { dynamicVar } from '../dynamicVars';
 import type { GlobalVariable, Step, SuiteVariable } from '../types';
 
 /**
  * Scans a step's fields for {{placeholders}}, shows each as a chip:
  * green = defined (global, suite var, or captured by an EARLIER step),
+ * blue = a dynamic variable the runner generates at send time ({{$guid}} etc.),
  * red = undefined, with a one-click "define as global" action.
  */
 
@@ -53,6 +55,17 @@ export default function VarChips({
   return (
     <div className="var-chips">
       {tokens.map((t) => {
+        // Dynamic variables are never "undefined": the runner generates them, so
+        // they get their own chip and no "define as global" action.
+        const dyn = dynamicVar(t);
+        if (dyn) {
+          return (
+            <span key={t} className="var-chip dynamic" title={`{{${t}}} — ${dyn.description}. Generated per use, e.g. ${dyn.example}`}>
+              {'{{'}{t}{'}}'}
+              <span className="var-chip-note">generated</span>
+            </span>
+          );
+        }
         const isDefined = defined.has(t);
         const src = captured.has(t) ? 'captured by an earlier step'
           : suiteVars.some((v) => v.key === t) ? 'suite variable'

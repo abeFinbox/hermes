@@ -1,0 +1,270 @@
+[
+  {
+    "name": "get-with-bearer-and-tokens",
+    "seedVars": {
+      "base_url": "https://apis-uat.example.test",
+      "token": "eyJhbGciOi.PAYLOAD.sig"
+    },
+    "step": {
+      "name": "Insights",
+      "request": {
+        "method": "get",
+        "url": "{{base_url}}/bank-connect/v1/insights",
+        "headers": [
+          {
+            "key": "x-api-key",
+            "value": "k-{{token}}",
+            "enabled": true
+          },
+          {
+            "key": "disabled-one",
+            "value": "nope",
+            "enabled": false
+          }
+        ],
+        "auth": {
+          "type": "bearer",
+          "token": "{{token}}"
+        }
+      }
+    }
+  },
+  {
+    "name": "query-params-encoding",
+    "comment": "encodeURIComponent semantics: space is %20 not +, and !'()*~ stay literal. net/url.QueryEscape would differ on every one of those.",
+    "seedVars": {
+      "base_url": "http://127.0.0.1:4000"
+    },
+    "step": {
+      "request": {
+        "method": "get",
+        "url": "{{base_url}}/mock/items?existing=1",
+        "params": [
+          {
+            "key": "q",
+            "value": "a b&c=d",
+            "enabled": true
+          },
+          {
+            "key": "punct",
+            "value": "!'()*~-_.",
+            "enabled": true
+          },
+          {
+            "key": "unicode",
+            "value": "na\u00efve \u2713",
+            "enabled": true
+          },
+          {
+            "key": "skipped",
+            "value": "x",
+            "enabled": false
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "post-json-default-content-type",
+    "seedVars": {
+      "u": "demo",
+      "p": "s3cr#t"
+    },
+    "step": {
+      "request": {
+        "method": "post",
+        "url": "http://127.0.0.1:4000/mock/login",
+        "body": {
+          "mode": "json",
+          "content": "{\"username\":\"{{u}}\",\"password\":\"{{p}}\"}"
+        }
+      }
+    }
+  },
+  {
+    "name": "post-json-explicit-content-type-wins",
+    "comment": "An explicit header must NOT be overwritten by the mode default, and must keep its original position in the -H order.",
+    "step": {
+      "request": {
+        "method": "post",
+        "url": "http://x.test/a",
+        "headers": [
+          {
+            "key": "Content-Type",
+            "value": "application/vnd.custom+json",
+            "enabled": true
+          },
+          {
+            "key": "accept",
+            "value": "application/json",
+            "enabled": true
+          }
+        ],
+        "body": {
+          "mode": "json",
+          "content": "{}"
+        }
+      }
+    }
+  },
+  {
+    "name": "basic-auth-overwrites-authorization-in-place",
+    "comment": "Authorization is set by a header FIRST, then overwritten by auth. The value changes; the position does not.",
+    "seedVars": {
+      "user": "ada",
+      "pass": "l0vela'ce"
+    },
+    "step": {
+      "request": {
+        "method": "get",
+        "url": "http://x.test/secure",
+        "headers": [
+          {
+            "key": "Authorization",
+            "value": "Bearer stale",
+            "enabled": true
+          },
+          {
+            "key": "x-trace",
+            "value": "1",
+            "enabled": true
+          }
+        ],
+        "auth": {
+          "type": "basic",
+          "username": "{{user}}",
+          "password": "{{pass}}"
+        }
+      }
+    }
+  },
+  {
+    "name": "single-quote-in-every-position",
+    "comment": "POSIX quoting is the whole reason this is a shared fixture: a value with a quote must survive in url, header, and body.",
+    "seedVars": {
+      "q": "it's"
+    },
+    "step": {
+      "request": {
+        "method": "post",
+        "url": "http://x.test/{{q}}/path",
+        "headers": [
+          {
+            "key": "x-note",
+            "value": "value with 'quotes' inside",
+            "enabled": true
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "content": "line1 'quoted'\nline2"
+        }
+      }
+    }
+  },
+  {
+    "name": "form-urlencoded",
+    "step": {
+      "request": {
+        "method": "post",
+        "url": "http://x.test/form",
+        "body": {
+          "mode": "form",
+          "content": "a=1&b=two words"
+        }
+      }
+    }
+  },
+  {
+    "name": "form-data-text-and-file",
+    "fileMeta": {
+      "f1": {
+        "filename": "statement 2026.pdf",
+        "mime": "application/pdf"
+      }
+    },
+    "seedVars": {
+      "who": "ada"
+    },
+    "step": {
+      "request": {
+        "method": "post",
+        "url": "http://x.test/upload",
+        "body": {
+          "mode": "form-data",
+          "content": "",
+          "formData": [
+            {
+              "key": "name",
+              "value": "{{who}}",
+              "type": "text",
+              "enabled": true
+            },
+            {
+              "key": "doc",
+              "fileId": "f1",
+              "type": "file",
+              "enabled": true
+            },
+            {
+              "key": "missing-meta",
+              "fileId": "nope",
+              "type": "file",
+              "enabled": true
+            },
+            {
+              "key": "off",
+              "value": "x",
+              "type": "text",
+              "enabled": false
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "name": "host-header-pin",
+    "comment": "A pinned run sends an explicit Host; it must appear last, after auth.",
+    "hostHeader": "apis-uat.example.test",
+    "step": {
+      "request": {
+        "method": "get",
+        "url": "http://apis-uat.example.test/health",
+        "auth": {
+          "type": "bearer",
+          "token": "t"
+        }
+      }
+    }
+  },
+  {
+    "name": "unresolved-token-stays-literal",
+    "comment": "A variable captured at runtime cannot be resolved statically. It must remain {{session_id}} so the reader substitutes it, rather than silently becoming empty.",
+    "seedVars": {
+      "base_url": "http://x.test"
+    },
+    "step": {
+      "request": {
+        "method": "get",
+        "url": "{{base_url}}/session/{{session_id}}/identity",
+        "headers": [
+          {
+            "key": "x-session",
+            "value": "{{session_id}}",
+            "enabled": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "name": "no-body-method-with-body-mode-none",
+    "step": {
+      "request": {
+        "method": "delete",
+        "url": "http://x.test/thing/1"
+      }
+    }
+  }
+]

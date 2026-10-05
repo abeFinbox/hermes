@@ -1,18 +1,21 @@
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { statSync } from 'node:fs';
-import { db, FILES_DIR, INSTANCE_ID } from '../db.js';
+import { db, FILES_DIR, INSTANCE_ID, HERA_ACTIVE_STATUSES } from '../db.js';
 import { getGlobals } from '../routes/variables.js';
+import { envNameFor, getEnvVars } from '../routes/environments.js';
 import { getFileRow } from '../routes/files.js';
 import { getSuite } from '../routes/suites.js';
 import type { Suite } from '../types.js';
 import { heraLimits, MILLICORES_PER_VU, type HeraLimits } from './config.js';
 import { k6Capability } from './k6-binary.js';
 import { generateScript, stepMetas, type HeraLoadConfig } from './script.js';
+import { deriveProfile, isHeraMode, schedulesInScript, type HeraMode } from './profile.js';
 import { spawnK6, statusForExit, type K6RunHandle } from './process.js';
 import { ProgressCollector, pickLoopbackPort, type HeraSample } from './progress.js';
 import { interpolate, validateTarget, type ResolvedTarget } from './target.js';
 import { acquireLock, heartbeat, releaseLock } from './lock.js';
+import { LogRing, sliceFromTail, type LogSlice } from './logring.js';
 import type { HeraSummaryDoc } from './summary.js';
 import { lookup } from 'node:dns/promises';
 
@@ -31,6 +34,10 @@ export interface HeraRequestedConfig {
   suiteId: string;
   vus: number;
   durationSec: number;
+  /** Shape of the run; absent or unknown means flat. */
+  mode?: string;
+  /** Target requests/s for 'rate' mode; absent means the server ceiling. */
+  ratePerSec?: number | null;
   thinkTimeMs?: number;
   p95Ms?: number | null;
   errorRatePct?: number | null;
@@ -67,11 +74,22 @@ export interface PreflightResult {
 
 // ---------- variables & files ----------
 
-/** Merged seed: globals first, then suite variables win (mirrors VarScope). */
-export function buildSeedVars(suite: Suite): Record<string, string> {
+/**
+ * Merged seed, mirroring VarScope's runtime > environment > global > suite.
+ *
+ * Written lowest-priority-first so each layer overwrites the one below it: suite
+ * variables are the fallback a suite ships with, globals override them, and the
+ * selected environment overrides both.
+ *
+ * Every virtual user starts from this map, so an environment chosen at launch is
+ * what the whole load test runs against — the same switch that redirects a
+ * normal run redirects 20 VUs at a staging host.
+ */
+export function buildSeedVars(suite: Suite, envId?: string | null): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const g of getGlobals()) out[g.key] = g.value;
   for (const v of suite.variables) out[v.key] = v.value;
+  for (const g of getGlobals()) out[g.key] = g.value;
+  if (envId) for (const e of getEnvVars(envId)) out[e.key] = e.value;
   return out;
 }
 
@@ -114,20 +132,6 @@ function tokensIn(text: string): string[] {
   return [...String(text).matchAll(TOKEN_SCAN)].map((m) => m[1]);
 }
 
-/**
- * Replace the origin with the resolved IP, keeping the rest of the (possibly
- * still templated) URL. This is the "pin" half of resolve-then-pin.
- */
-export function pinnedUrl(interpolatedUrl: string, target: ResolvedTarget): string {
-  const m = /^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*)(.*)$/i.exec(interpolatedUrl);
-  if (!m || !target.resolvedIp) return interpolatedUrl;
-  const ip = target.resolvedIp.includes(':') ? `[${target.resolvedIp}]` : target.resolvedIp;
-  const isDefaultPort =
-    (target.scheme === 'http' && target.port === '80') || (target.scheme === 'https' && target.port === '443');
-  const authority = isDefaultPort ? ip : `${ip}:${target.port}`;
-  return m[1] + authority + m[3];
-}
-
 // ---------- caps ----------
 
 export function clampConfig(req: HeraRequestedConfig, limits: HeraLimits, capCores?: number): ClampResult {
@@ -152,12 +156,25 @@ export function clampConfig(req: HeraRequestedConfig, limits: HeraLimits, capCor
   const rps = limits.maxRps;
   const thinkTimeMs = Math.max(0, Math.min(60_000, Math.trunc(Number(req.thinkTimeMs) || 0)));
 
+  // An unknown mode falls back to flat rather than failing the launch: a client
+  // sending a mode this build does not have should still get a run.
+  const mode: HeraMode = isHeraMode(req.mode) ? req.mode : 'constant';
+  if (req.mode !== undefined && req.mode !== null && !isHeraMode(req.mode)) {
+    notes.push(`Unknown load mode "${req.mode}" — ran flat instead.`);
+  }
+  // Derived AFTER the vus/duration clamps, so a shape can never exceed a cap the
+  // flat run would have respected.
+  const profile = deriveProfile(mode, vus, durationSec, rps, req.ratePerSec);
+  for (const n of profile.notes) notes.push(n);
+
   return {
     applied: {
       suiteId: req.suiteId,
       vus,
       durationSec,
       rps,
+      mode: profile.mode,
+      ratePerSec: profile.ratePerSec,
       thinkTimeMs,
       p95Ms: req.p95Ms === undefined || req.p95Ms === null ? null : Math.max(1, Math.trunc(req.p95Ms)),
       errorRatePct:
@@ -169,10 +186,30 @@ export function clampConfig(req: HeraRequestedConfig, limits: HeraLimits, capCor
   };
 }
 
+/**
+ * Compose `host` or `host:port` for k6's DNS override map and for the origin
+ * strings we display and audit.
+ *
+ * IPv6 literals MUST be bracketed. Without this, `localhost` resolving to `::1`
+ * produced the key/value pair `localhost:4099 -> ::1:4099`, which k6 parses as
+ * host `::1` with NO port, then dials port 0 — every request in the run fails
+ * with "can't assign requested address" (errno 49). Verified on macOS, where
+ * `localhost` resolves to ::1 first.
+ */
+function hostPort(host: string, port?: string | null): string {
+  const h = host.includes(':') ? `[${host}]` : host;
+  return port === undefined || port === null || port === '' ? h : `${h}:${port}`;
+}
+
 // ---------- preflight ----------
 
-export async function preflight(suite: Suite, limits: HeraLimits, selfPort: string): Promise<PreflightResult> {
-  const seed = buildSeedVars(suite);
+export async function preflight(
+  suite: Suite,
+  limits: HeraLimits,
+  selfPort: string,
+  envId?: string | null,
+): Promise<PreflightResult> {
+  const seed = buildSeedVars(suite, envId);
   const enabled = suite.steps.filter((s) => s.enabled);
   const findings: PreflightResult['findings'] = [];
   const steps: PreflightStep[] = [];
@@ -200,7 +237,7 @@ export async function preflight(suite: Suite, limits: HeraLimits, selfPort: stri
       target,
     });
     if (target.ok && target.host) {
-      const origin = `${target.scheme}://${target.host}:${target.port}`;
+      const origin = `${target.scheme}://${hostPort(target.host, target.port)}`;
       const prev = hostCounts.get(origin) ?? { requests: 0, external: !target.selfMock };
       hostCounts.set(origin, { requests: prev.requests + 1, external: prev.external });
     }
@@ -293,6 +330,8 @@ interface ActiveRun {
   collector?: ProgressCollector;
   timer?: NodeJS.Timeout;
   stopRequested: boolean;
+  /** Live k6 output, served by GET /api/hera/:id/logs while this run is ours. */
+  logs?: LogRing;
 }
 
 const activeRuns = new Map<string, ActiveRun>();
@@ -315,6 +354,8 @@ export interface StartRunInput {
   clampNotes: string[];
   actor: { id: string; username: string; role: string; ip: string };
   selfPort: string;
+  /** Environment the VUs resolve variables against; null = globals + suite only. */
+  envId?: string | null;
 }
 
 export interface StartRunOutput {
@@ -364,7 +405,9 @@ export async function startRun(input: StartRunInput): Promise<StartRunOutput | S
     return { ok: false, status: 503, error: cap.reason ?? 'Hera is not available on this instance.' };
   }
 
-  const pre = await preflight(suite, limits, input.selfPort);
+  const envId = input.envId || null;
+  const envName = envNameFor(envId);
+  const pre = await preflight(suite, limits, input.selfPort, envId);
   if (!pre.ok) {
     const first = pre.findings.find((f) => f.level === 'error');
     audit('reject', null, { ...input, suiteId: suite.id, detail: { reason: first?.message } });
@@ -389,16 +432,35 @@ export async function startRun(input: StartRunInput): Promise<StartRunOutput | S
     };
   }
 
-  const seed = buildSeedVars(suite);
+  const seed = buildSeedVars(suite, envId);
   const { filePaths, fileMeta } = collectFiles(suite);
-  const pins: Record<string, { url: string; hostHeader: string }> = {};
+  // Resolve-then-pin as a k6 DNS override: hostname -> validated IP. Keeping the
+  // hostname in the URL is what lets HTTPS work (a literal-IP URL fails cert
+  // validation — no IP SANs). Keyed by host[:non-default-port].
+  //
+  // When the key carries a port, the VALUE must carry the same port. k6 reads a
+  // port-less value as port 0 and then dials it, which fails with
+  // "can't assign requested address" (errno 49) on every request — verified.
+  const pinHosts: Record<string, string> = {};
   for (const s of pre.steps) {
-    if (s.target.ok && s.target.host) {
-      pins[s.stepId] = { url: pinnedUrl(s.resolvedUrl, s.target), hostHeader: s.target.host };
+    if (s.target.ok && s.target.host && s.target.resolvedIp) {
+      const isDefaultPort =
+        (s.target.scheme === 'http' && s.target.port === '80') ||
+        (s.target.scheme === 'https' && s.target.port === '443');
+      const key = isDefaultPort ? hostPort(s.target.host) : hostPort(s.target.host, s.target.port);
+      pinHosts[key] = isDefaultPort ? hostPort(s.target.resolvedIp) : hostPort(s.target.resolvedIp, s.target.port);
     }
   }
 
-  const { script } = generateScript({ suite, seedVars: seed, load: applied, filePaths, fileMeta, pins });
+  const { script } = generateScript({
+    suite,
+    seedVars: seed,
+    load: applied,
+    filePaths,
+    fileMeta,
+    hosts: pinHosts,
+    diag: { enabled: limits.diag, max: limits.diagMax, body: limits.diagBody, bodyMax: limits.diagBodyMax },
+  });
   const metas = stepMetas(suite);
   const now = new Date().toISOString();
   const hosts = pre.hosts.map((h) => h.origin);
@@ -406,8 +468,8 @@ export async function startRun(input: StartRunInput): Promise<StartRunOutput | S
   db.prepare(
     `INSERT INTO hera_runs (id, suite_id, suite_name, status, config_json, applied_config_json, target_hosts_json,
       k6_version, backend, owner_instance, heartbeat_at, started_at, samples_json, steps_json, confidence,
-      created_by_user_id, created_by_username, created_by_role, source_ip)
-     VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, 'node', ?, ?, ?, '[]', ?, 'unknown', ?, ?, ?, ?)`,
+      created_by_user_id, created_by_username, created_by_role, source_ip, env_id, env_name)
+     VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, 'node', ?, ?, ?, '[]', ?, 'unknown', ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     suite.id,
@@ -424,22 +486,24 @@ export async function startRun(input: StartRunInput): Promise<StartRunOutput | S
     input.actor.username,
     input.actor.role,
     input.actor.ip,
+    envId,
+    envName,
   );
 
   audit('launch', id, {
     ...input,
     suiteId: suite.id,
     hosts,
-    detail: { applied, clampNotes: input.clampNotes, pinned: Object.values(pins).map((p) => p.url) },
+    detail: { applied, clampNotes: input.clampNotes, pinned: pinHosts, envId, envName },
   });
   console.error(
     `[hera] launch run=${id} by=${input.actor.username}(${input.actor.role}) ip=${input.actor.ip} ` +
-      `suite=${suite.name} vus=${applied.vus} duration=${applied.durationSec}s rps=${applied.rps} hosts=${hosts.join(',')}`,
+      `suite=${suite.name} env=${envName || '(none)'} vus=${applied.vus} duration=${applied.durationSec}s rps=${applied.rps} hosts=${hosts.join(',')}`,
   );
 
   // Register BEFORE spawning so an immediate stop is not lost in the gap
   // between the 202 response and k6 actually starting.
-  activeRuns.set(id, { stopRequested: false });
+  activeRuns.set(id, { stopRequested: false, logs: new LogRing(limits.logLines) });
 
   // Fire and forget; the UI polls GET /api/hera/:id.
   void execute(id, script, applied);
@@ -452,12 +516,27 @@ async function execute(id: string, script: string, applied: AppliedConfig): Prom
     const port = await pickLoopbackPort();
     collector = new ProgressCollector(port);
     collector.start();
+    // The ring was created in startRun, before the spawn window, so a poll that
+    // lands during it gets an empty log rather than "run not found".
+    const logs = activeRuns.get(id)?.logs ?? new LogRing(heraLimits().logLines);
     const handle = spawnK6({
       script,
       durationSec: applied.durationSec,
       rps: applied.rps,
       runId: id,
       restPort: port,
+      // A shaped run schedules itself from the script; passing --duration would
+      // flatten it back.
+      scheduleInScript: schedulesInScript(
+        deriveProfile(
+          isHeraMode(applied.mode) ? applied.mode : 'constant',
+          applied.vus,
+          applied.durationSec,
+          applied.rps,
+          applied.ratePerSec,
+        ),
+      ),
+      onStderrLine: (line) => logs.push(line),
     });
 
     const timer = setInterval(() => {
@@ -476,6 +555,7 @@ async function execute(id: string, script: string, applied: AppliedConfig): Prom
     timer.unref();
 
     const entry = activeRuns.get(id) ?? { stopRequested: false };
+    entry.logs = logs;
     entry.handle = handle;
     entry.collector = collector;
     entry.timer = timer;
@@ -561,6 +641,8 @@ function rowToListItem(r: any) {
     suiteId: r.suite_id,
     suiteName: r.suite_name,
     status: r.status,
+    envId: r.env_id ?? null,
+    envName: r.env_name ?? '',
     config: JSON.parse(r.applied_config_json || '{}'),
     startedAt: r.started_at,
     finishedAt: r.finished_at,
@@ -593,6 +675,59 @@ export function getRun(id: string, sinceT?: number) {
     sampleCount: all.length,
     stderrTail: r.stderr_tail || '',
   };
+}
+
+export interface RunLogsResponse extends LogSlice {
+  /** Which engine owns the row; the client uses it to re-target, not to error. */
+  runBackend: string;
+  /** True while these lines are still arriving. */
+  live: boolean;
+  /** False when this process cannot see the run's logs at all. */
+  available: boolean;
+  /**
+   * Where these lines came from, and the ONLY safe way to merge them.
+   *
+   * 'live' numbering is the run's monotonic cursor, so a client appends what it
+   * gets and passes `cursor` back as ?sinceLine=. 'tail' numbering restarts at 1
+   * — the persisted column is a 64KB suffix of the output, not the whole of it —
+   * so a client seeing 'tail' must REPLACE its buffer rather than append, or it
+   * shows every line twice the moment a run finishes. 'none' means no lines
+   * exist here at all; keep whatever you already have.
+   */
+  source: 'live' | 'tail' | 'none';
+  reason?: string;
+}
+
+/**
+ * Logs for one run, from memory while we own it and from stderr_tail once it is
+ * over.
+ *
+ * The awkward case is a live run owned by the OTHER backend: both are up against
+ * one database, and a ring lives in the process that spawned k6. There is
+ * nothing to serve, so this says so explicitly instead of returning an empty
+ * list that reads as "k6 printed nothing".
+ */
+export function getRunLogs(id: string, sinceLine: number): RunLogsResponse | null {
+  const r = db.prepare('SELECT backend, status, stderr_tail FROM hera_runs WHERE id = ?').get(id) as any;
+  if (!r) return null;
+  const active = activeRuns.get(id);
+  if (active?.logs) {
+    return { ...active.logs.since(sinceLine), runBackend: r.backend, live: true, available: true, source: 'live' };
+  }
+  if (HERA_ACTIVE_STATUSES.includes(r.status)) {
+    return {
+      lines: [],
+      cursor: 0,
+      firstLine: 0,
+      dropped: 0,
+      runBackend: r.backend,
+      live: false,
+      available: false,
+      source: 'none',
+      reason: `This run is owned by the ${r.backend} backend. Live output is only available there.`,
+    };
+  }
+  return { ...sliceFromTail(r.stderr_tail || ''), runBackend: r.backend, live: false, available: true, source: 'tail' };
 }
 
 export function deleteRun(id: string): void {

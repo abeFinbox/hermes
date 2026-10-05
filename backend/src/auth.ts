@@ -84,6 +84,10 @@ export function enforcePermissions(req: AuthedRequest, res: Response, next: Next
   const isExecute =
     (p === '/runs' && m === 'POST') ||
     (p === '/runs/step' && m === 'POST') ||
+    // Script bench: runs a sandbox script against a response the user typed in.
+    // No HTTP request, no persistence — strictly less powerful than /runs/step,
+    // which every role already has.
+    (p === '/runs/try-script' && m === 'POST') ||
     (/^\/runs\/[^/]+\/(stop|report)$/.test(p) && m === 'POST') ||
     (/^\/hera\/[^/]+\/stop$/.test(p) && m === 'POST');
   if (isExecute) return next();

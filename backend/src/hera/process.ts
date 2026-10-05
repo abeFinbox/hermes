@@ -63,6 +63,17 @@ export interface SpawnOptions {
    * Omit to leave the API off entirely (k6's default).
    */
   restPort?: number;
+  /**
+   * The script's own options carry the schedule (stages or scenarios), so no
+   * --duration flag may be passed: on the CLI it wins and flattens the shape.
+   */
+  scheduleInScript?: boolean;
+  /**
+   * Receives every complete k6 output line as it arrives, for the live log
+   * ring. The stderr tail is accumulated independently: this callback is
+   * additive and may be omitted.
+   */
+  onStderrLine?: (line: string) => void;
 }
 
 /** Derive the run status from how k6 exited. */
@@ -100,11 +111,21 @@ export function spawnK6(opts: SpawnOptions): K6RunHandle {
     '-', // read the script from stdin
     '--quiet',
     '--no-usage-report',
-    '--duration',
-    `${opts.durationSec}s`,
+    // One JSON object per line. The default logfmt escapes the message, so a
+    // diagnostic containing a response body arrives double-quoted and is
+    // painful to read in the UI; this makes level/time/msg addressable.
+    '--log-format',
+    'json',
     '--rps',
     String(opts.rps),
   ];
+  // --duration on the CLI OVERRIDES options.stages and options.scenarios, so a
+  // shaped run would silently flatten back to a plain one. The script carries the
+  // schedule in those modes; the watchdog below still uses durationSec, which the
+  // profile guarantees is the total.
+  if (!opts.scheduleInScript) {
+    args.push('--duration', `${opts.durationSec}s`);
+  }
   if (opts.restPort) {
     // 127.0.0.1 ONLY. k6's REST API is unauthenticated and can change VU counts,
     // so it must never be reachable off-box. --profiling-enabled stays off.
@@ -127,6 +148,8 @@ export function spawnK6(opts: SpawnOptions): K6RunHandle {
   let stdout = '';
   let stdoutBytes = 0;
   let truncatedStdout = false;
+  /** Trailing fragment of stderr that has no newline yet. */
+  let stderrPartial = '';
   let stderr = '';
   let killed: KilledReason = null;
   let settled = false;
@@ -178,6 +201,16 @@ export function spawnK6(opts: SpawnOptions): K6RunHandle {
       // keep the TAIL: that is where the error is
       stderr = stderr.slice(stderr.length - MAX_STDERR_BYTES);
     }
+    // Split for the log ring alongside — a chunk is not a line, so the trailing
+    // fragment is held over until the next chunk (or flushed at exit).
+    if (!opts.onStderrLine) return;
+    stderrPartial += chunk;
+    let nl = stderrPartial.indexOf('\n');
+    while (nl !== -1) {
+      opts.onStderrLine(stderrPartial.slice(0, nl));
+      stderrPartial = stderrPartial.slice(nl + 1);
+      nl = stderrPartial.indexOf('\n');
+    }
   });
 
   const done = new Promise<K6RunResult>((resolve) => {
@@ -186,6 +219,11 @@ export function spawnK6(opts: SpawnOptions): K6RunHandle {
       settled = true;
       clearTimeout(watchdog);
       if (graceTimer) clearTimeout(graceTimer);
+      // A last line without a trailing newline is still a line.
+      if (opts.onStderrLine && stderrPartial !== '') {
+        opts.onStderrLine(stderrPartial);
+        stderrPartial = '';
+      }
       const { doc, error } = parseSummary(stdout);
       resolve({
         exitCode,

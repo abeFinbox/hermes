@@ -30,6 +30,26 @@ type Limits struct {
 	TargetAllow []string
 	// K6Bin is an explicit binary path; empty means "look on PATH".
 	K6Bin string
+	// LogLines is how many lines of k6 output are kept in memory per run, for
+	// the live log panel.
+	LogLines int
+	// Diag emits a diagnostic line when a step fails, so a red step is
+	// explainable.
+	Diag bool
+	// DiagMax is diagnostic lines per step, PER VU: the real ceiling is
+	// DiagMax * vus.
+	DiagMax int
+	// DiagBody includes a response-body snippet in diagnostics.
+	//
+	// ON by default: the status code alone rarely explains a 4xx, and the error
+	// message in the body is the thing an operator actually needs. The trade-off
+	// is real — these lines are persisted in stderr_tail, so response payloads
+	// sit at rest in the run row until it is deleted — which is why the snippet
+	// is hard-truncated and why HERA_DIAG_BODY=0 turns it off for instances
+	// pointed at production data.
+	DiagBody bool
+	// DiagBodyMax is the hard truncation for that snippet.
+	DiagBodyMax int
 }
 
 // Defaults / ceilings. The ceiling is the most a deployment may raise a value to.
@@ -42,6 +62,18 @@ const (
 	CeilingMaxRps         = 1000
 	DefaultMaxRequests    = 20000
 	CeilingMaxRequests    = 100000
+	DefaultLogLines       = 2000
+	MinLogLines           = 100
+	CeilingLogLines       = 20000
+	DefaultDiagMax        = 3
+	CeilingDiagMax        = 50
+	DefaultDiagBodyMax    = 512
+	CeilingDiagBodyMax    = 2048
+
+	// MaxLogRingBytes is the bytes of parsed log lines held per run,
+	// independent of MaxStderrBytes. The ring evicts on whichever bound trips
+	// first: lines, then bytes.
+	MaxLogRingBytes = 512 * 1024
 
 	// MinMillicores is the minimum CPU for latency numbers worth trusting.
 	MinMillicores = 1000
@@ -88,5 +120,10 @@ func GetLimits() Limits {
 		AllowConstrained: boolEnv("HERA_ALLOW_CONSTRAINED", false),
 		TargetAllow:      allow,
 		K6Bin:            strings.TrimSpace(os.Getenv("HERA_K6_BIN")),
+		LogLines:         intEnv("HERA_LOG_LINES", DefaultLogLines, MinLogLines, CeilingLogLines),
+		Diag:             boolEnv("HERA_DIAG", true),
+		DiagMax:          intEnv("HERA_DIAG_MAX", DefaultDiagMax, 1, CeilingDiagMax),
+		DiagBody:         boolEnv("HERA_DIAG_BODY", true),
+		DiagBodyMax:      intEnv("HERA_DIAG_BODY_MAX", DefaultDiagBodyMax, 32, CeilingDiagBodyMax),
 	}
 }

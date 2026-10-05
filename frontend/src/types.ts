@@ -107,6 +107,8 @@ export interface Suite {
   steps: Step[];
   variables: SuiteVariable[];
   settings: SuiteSettings;
+  /** Environment pre-selected for runs of this suite; null = none. */
+  defaultEnvId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -184,6 +186,10 @@ export interface HeraAppliedConfig {
   vus: number;
   durationSec: number;
   rps: number;
+  /** Shape of the run. Absent on runs recorded before profiles existed. */
+  mode?: string;
+  /** Target requests/s, set only by 'rate' mode. */
+  ratePerSec?: number | null;
   thinkTimeMs: number;
   p95Ms: number | null;
   errorRatePct: number | null;
@@ -240,6 +246,9 @@ export interface HeraRunListItem {
   suiteId: string;
   suiteName: string;
   status: HeraStatus;
+  /** Environment the load test ran against (null = globals + suite only). */
+  envId: string | null;
+  envName: string;
   config: HeraAppliedConfig;
   startedAt: string;
   finishedAt: string | null;
@@ -258,6 +267,77 @@ export interface HeraRun extends HeraRunListItem {
   /** Total held server-side, so `?since=` responses can still show progress. */
   sampleCount: number;
   stderrTail: string;
+}
+
+/** One stage of a shaped run: reach `target` VUs by the end of it. */
+export interface HeraStage {
+  durationSec: number;
+  target: number;
+}
+
+/**
+ * The derived shape of a run. Always fetched from the server — deriving stages
+ * in the browser would be a third implementation nobody diffs.
+ */
+export interface HeraProfilePreview {
+  modes: Array<{ mode: string; label: string }>;
+  /** Server ceiling for requests/s, which 'rate' mode is clamped to. */
+  maxRps: number;
+  mode: string;
+  vus: number;
+  durationSec: number;
+  /** Empty for the flat modes, which use plain vus + duration. */
+  stages: HeraStage[];
+  /** Set only for 'rate', which pins throughput instead of VUs. */
+  ratePerSec: number | null;
+  summary: string;
+  /** Why the requested shape was not used verbatim, if it was not. */
+  notes: string[];
+}
+
+/** One line of k6 output. level is 'raw' when the line was not JSON. */
+export interface HeraLogLine {
+  n: number;
+  t: string;
+  level: string;
+  msg: string;
+}
+
+export interface HeraLogsResponse {
+  lines: HeraLogLine[];
+  /** Total lines ever emitted; pass back as ?sinceLine= to resume. */
+  cursor: number;
+  /** Oldest retained line number; 0 when nothing is retained. */
+  firstLine: number;
+  /** Lines evicted from the server-side ring. */
+  dropped: number;
+  runBackend: string;
+  live: boolean;
+  available: boolean;
+  /**
+   * How to merge: 'live' numbering is monotonic, so append and resume from
+   * `cursor`. 'tail' comes from the persisted 64KB suffix and renumbers from 1,
+   * so REPLACE the buffer instead — appending shows every line twice the moment
+   * a run finishes. 'none' means this engine has nothing; keep what you have.
+   */
+  source: 'live' | 'tail' | 'none';
+  reason?: string;
+}
+
+/**
+ * A paste-runnable cURL for one step. Built on demand and never persisted — it
+ * resolves real values, secret variables included, so it is only served to the
+ * roles that may launch a run.
+ */
+export interface HeraStepCurl {
+  stepId: string;
+  name: string;
+  method: string;
+  curl: string;
+  /** Variables captured at runtime, left as {{name}} for the reader to fill. */
+  unresolved: string[];
+  /** The suite changed after the run, so this is the request as it is NOW. */
+  staleWarning: boolean;
 }
 
 export interface HeraCapability {
@@ -304,6 +384,9 @@ export interface HeraPreflight {
   findings: Array<{ level: 'info' | 'warn' | 'error'; message: string }>;
   estimate: { requestsPerIteration: number; unbounded: boolean; note: string };
   secretsNeeded: string[];
+  /** Environment this preview resolved against, echoed back by the server. */
+  envId?: string | null;
+  envName?: string;
 }
 
 /** Small enough to be harmless, large enough to be useful. */
@@ -315,6 +398,40 @@ export interface GlobalVariable {
   key: string;
   value: string;
   secret: boolean;
+}
+
+/** One variable inside an environment — same shape as a global/suite variable. */
+export interface EnvironmentVariable {
+  key: string;
+  value: string;
+  secret: boolean;
+}
+
+/**
+ * A named, reusable variable set (dev, staging, custom...). The most specific
+ * layer below runtime captures: runtime > environment > global > suite.
+ */
+export interface Environment {
+  id: string;
+  name: string;
+  description: string;
+  variables: EnvironmentVariable[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Result of POST /api/runs/try-script — the script bench in the step editor. */
+export interface ScriptBenchResult {
+  mode: 'validate' | 'capture' | 'poll';
+  assertions: AssertionResult[];
+  captured: CapturedValue[];
+  logs: string[];
+  /** True when a poll stop script called stop() — polling would end here. */
+  stopRequested: boolean;
+  failed: boolean;
+  /** Script threw outside a test(): syntax error, bad JSON.parse, timeout. */
+  error?: string;
+  usedVariables: Array<{ key: string; value: string }>;
 }
 
 export interface CollectionListItem {
@@ -392,6 +509,10 @@ export interface Run {
   status: 'running' | 'passed' | 'failed' | 'error' | 'stopped';
   cycles: number;
   stopOnFailure: boolean;
+  /** Environment this run resolved variables against (null = globals + suite). */
+  envId: string | null;
+  /** Name at launch time — readable even after a rename or delete. */
+  envName: string;
   startedAt: string;
   finishedAt: string | null;
   cycleResults: CycleResult[];

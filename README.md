@@ -12,6 +12,13 @@ Both docs are also readable in-app under **Docs** in the sidebar.
 Requirements: **Node.js ≥ 22** (uses the built-in `node:sqlite`).
 
 ```bash
+# one command, all three servers (Node API :4000, Go API :4001, UI :5173)
+./start-local.sh
+```
+
+It takes over its own ports if a previous run is still up, refuses to touch a port held by anything else, prefixes each server's output with `[node]` / `[go]` / `[ui]`, and stops all three on Ctrl+C. Or start them by hand:
+
+```bash
 # 1. backend — API on http://localhost:4000
 cd backend && npm install && npm run start
 
@@ -36,20 +43,24 @@ cd backend-go && go run .   # API on http://localhost:4001
 | Area | What you get |
 |---|---|
 | **Import** | Postman collection v2.0/v2.1 (upload or paste) → editable suite; folders, auth, bodies and pm scripts preserved |
-| **Suites** | Create from import or from scratch; everything editable (requests, order, assertions, captures, variables, settings); duplicate; copy-on-write from the original collection |
+| **Suites** | Create from import or from scratch; everything editable (requests, order, assertions, captures, variables, settings); drag-and-drop step reordering; duplicate; copy-on-write from the original collection |
 | **File uploads** | `form-data` (multipart) body mode: mix text fields and file fields; files come from a shared server-side **Files** store (upload once, reference anywhere) |
 | **Chaining** | Capture values from a response (JSONPath / header / status, or a script) into variables; later steps use them as `{{var}}` |
 | **Validation** | Visual assertion rules + sandboxed `test()`/`expect()` scripts; per-assertion results in every run |
-| **Variables** | Global + suite scopes with Postman-style precedence; secret masking; undefined `{{placeholders}}` flagged inline with one-click "define as global" |
+| **Dynamic tokens** | `{{$guid}}`, `{{$timestamp}}`, `{{$isoTimestamp}}`, `{{$date}}`, `{{$epochMillis}}`, `{{$randomInt}}`, `{{$randomHex}}` — generated at send time, usable in URL, headers, params, body and auth, and evaluated per occurrence (two `{{$guid}}` are two ids). Each k6 virtual user generates its own |
+| **Script bench** | Try a validation, capture or poll-stop script against a response you type in — no request sent, nothing saved. Shows the assertions that would fire, the variables that would be captured, and what each `{{token}}` resolved to |
+| **Variables** | Four scopes, resolved **runtime → environment → global → suite** (suite variables are the fallback a suite ships with, so an imported `base_url` can't shadow the environment you picked); secret masking; undefined `{{placeholders}}` flagged inline with one-click "define as global" |
+| **Environments** | Named, reusable variable sets (dev, staging, custom...). Pick one per suite as its default and override it per run or per load test; every run records the environment it used |
 | **Runs** | 1–100 cycles, stop-on-failure, live progress, full per-step request/response/assertion/capture/log detail |
 | **Load testing (Hera)** | Run any suite under concurrency with the real **k6** binary: every virtual user walks all enabled steps in order, carrying captures between them. Capture/validation scripts run unchanged, polling is measured as time-to-completion, and targets are default-deny |
-| **Single-step Send** | Run one request ad-hoc with unsaved edits; captures fold back so you can test a chain step by step |
+| **Single-step Send** | Run one request ad-hoc with unsaved edits (⌘/Ctrl + Enter from anywhere in the editor); captures fold back so you can test a chain step by step |
 | **Suite composer** | Draggable basket: collect requests across suites → create a new suite from them (referenced variables carried over) |
 | **Export** | Any suite → Postman collection v2.1 (re-importable here or in Postman); visual rules become `pm.test` scripts |
 | **Reports** | JSON report stub per run (download) — extension point for HTML/PDF rendering |
 | **Auth** | Login + locally-generated captcha (no external service), JWT httpOnly cookie, login rate limiting, admin user management |
 | **Roles** | Three user types — **admin** (full access), **moderator** (create/edit + appearance, no deletion), **npc** (read-only + execute runs, no admin/docs) — enforced on both backends and reflected in the UI |
 | **Dual backend** | Interchangeable **Node** and **Go** backends serving one API over one database + session; switch live from Settings, with a read-only engine indicator in the top bar |
+| **Editor niceties** | ✨ Beautify / 🗜 Minify re-indent or collapse a JSON payload without breaking `{{tokens}}` — including bare ones used as values, and an exact round trip; ⌘/Ctrl + Enter sends the selected step, or runs the script bench when its panel is open; the step panel scrolls internally with method, URL and chips pinned |
 | **UI** | Legends toggle (ⓘ hover help on every function), light/dark/system + 8 theme presets + custom theme builder with live preview and JSON import/export |
 
 ## Dual backend engine (Node ⇄ Go)
@@ -143,9 +154,15 @@ Hermes/
 | `HERA_TARGET_ALLOW` | *(empty)* | Hosts Hera may target — exact, `*.suffix`, `host:port` or CIDR. **Empty means this instance's own `/mock` API and nothing else** |
 | `HERA_MAX_VUS` | `20` (ceiling 100) | Virtual-user cap; requests above it are reduced, not rejected |
 | `HERA_MAX_DURATION_SEC` | `60` (ceiling 300) | Run-length cap |
-| `HERA_MAX_RPS` | `200` (ceiling 1000) | Always passed to k6 as `--rps`; VU count alone is not a throughput bound |
+| `HERA_MAX_RPS` | `200` (ceiling 1000) | Always passed to k6 as `--rps`; VU count alone is not a throughput bound. Also the ceiling for `rate` mode's arrival rate |
 | `HERA_ALLOW_MODERATOR` | off | `1` lets moderators start load tests, not just admins |
+| `HERA_ALLOW_CONSTRAINED` | off | `1` runs even when the detected CPU quota is too low for trustworthy latency numbers |
 | `HERA_K6_BIN` | *(PATH)* | Explicit path to the k6 binary |
+| `HERA_LOG_LINES` | `2000` (100–20000) | k6 output lines kept in memory per run for the live log panel; also bounded at 512KB |
+| `HERA_DIAG` | `1` | Emit one diagnostic line per failed step (status + k6 error code), so a red step is explainable |
+| `HERA_DIAG_MAX` | `3` (ceiling 50) | Diagnostic lines per step **per VU** — the effective ceiling is this × VUs |
+| `HERA_DIAG_BODY` | `1` | Response-body snippet in diagnostics — usually the only thing that explains a 4xx. **Set `0` for instances pointed at production data: these lines are persisted in the run row, so bodies sit at rest** |
+| `HERA_DIAG_BODY_MAX` | `512` (ceiling 2048) | Hard truncation for that snippet |
 
 The **Go backend** reads the same variables (`PORT` defaults to `4001`, `DATA_DIR` defaults to the sibling `backend/data`, plus `DOCS_DIR` for the Docs page). Point both at the same `DATA_DIR` and give them the same `JWT_SECRET` for a seamless toggle.
 

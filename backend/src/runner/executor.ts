@@ -3,12 +3,15 @@ import { readFileSync } from 'node:fs';
 import { JSONPath } from 'jsonpath-plus';
 import { db } from '../db.js';
 import { getGlobals, setGlobal } from '../routes/variables.js';
+import { dynamicVarValue } from '../dynamic-vars.js';
+import { envNameFor, getEnvVars } from '../routes/environments.js';
 import { resolveStoredFile } from '../routes/files.js';
 import { runScript, type SandboxResponse } from './sandbox.js';
 import {
-  newId,
+  defaultSettings, newId,
   type Suite, type Step, type Run, type StepResult, type CycleResult, type RunSummary,
   type AssertionResult, type CapturedValue, type Assertion, type CaptureRule, type PollAttempt,
+  type SuiteVariable,
 } from '../types.js';
 
 const MAX_STORED_BODY = 64 * 1024; // request-body preview cap
@@ -30,6 +33,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 export class VarScope {
   private globalVars = new Map<string, string>();
+  private envVars = new Map<string, string>();
   private suiteVars = new Map<string, string>();
   private runtimeVars = new Map<string, string>();
   // Non-empty values of variables flagged `secret` — used to mask secrets out
@@ -37,10 +41,22 @@ export class VarScope {
   private secretValues = new Set<string>();
   globalsDirty = false;
 
-  constructor(suite: Suite) {
+  /**
+   * @param envId environment whose variables layer over the globals; null/absent
+   *   means globals + suite only. An id that no longer exists resolves to an
+   *   empty layer rather than an error, so a deleted environment degrades to
+   *   "no environment" instead of breaking every run that referenced it.
+   */
+  constructor(suite: Suite, envId?: string | null) {
     for (const g of getGlobals()) {
       this.globalVars.set(g.key, g.value);
       if (g.secret && g.value) this.secretValues.add(g.value);
+    }
+    if (envId) {
+      for (const e of getEnvVars(envId)) {
+        this.envVars.set(e.key, e.value);
+        if (e.secret && e.value) this.secretValues.add(e.value);
+      }
     }
     for (const v of suite.variables) {
       this.suiteVars.set(v.key, v.value);
@@ -55,11 +71,39 @@ export class VarScope {
     return out;
   }
 
+  /**
+   * Resolution order: runtime > environment > global > suite.
+   *
+   * This deliberately does NOT match Postman, where collection (suite) variables
+   * outrank the environment and globals. The reason is what suite variables
+   * actually are here: mostly values carried in by a Postman import — a
+   * `base_url` pointing at whatever host the collection was recorded against.
+   * With Postman's order those imported values silently shadowed the
+   * environment, so switching environment changed nothing and the globals you
+   * had just edited were ignored. Suite variables are therefore the FALLBACK
+   * layer: what a suite ships with, used when nothing above it defines the name.
+   *
+   * Captures are unaffected: a capture with scope 'suite' also writes the
+   * runtime layer (see set), which is still the top of the chain.
+   */
   get(key: string): string | undefined {
-    // runtime (captured this run) > suite > global — mirrors Postman scope precedence
-    return this.runtimeVars.get(key) ?? this.suiteVars.get(key) ?? this.globalVars.get(key);
+    // Dynamic variables are generated, not looked up, and are checked FIRST:
+    // no scope can shadow them because a stored variable name can never start
+    // with '$'. Evaluated per call, so two {{$guid}} differ — see dynamic-vars.ts.
+    const dyn = dynamicVarValue(key);
+    if (dyn !== undefined) return dyn;
+    return (
+      this.runtimeVars.get(key) ?? this.envVars.get(key) ?? this.globalVars.get(key) ?? this.suiteVars.get(key)
+    );
   }
 
+  /**
+   * NOTE on scope 'global' while an environment is selected: the write lands in
+   * global_variables as asked, but a same-named environment variable still wins
+   * on read for the rest of the run (see get()) — the environment is the more
+   * specific layer. Capture to suite/runtime scope if the value must be the one
+   * that resolves; both also write the runtime layer, which outranks everything.
+   */
   set(key: string, value: string, scope: 'suite' | 'global' | 'runtime') {
     if (scope === 'global') {
       this.globalVars.set(key, value);
@@ -170,6 +214,136 @@ function runVisualCapture(c: CaptureRule, resp: SandboxResponse): { value: strin
     default:
       throw new Error(`unknown capture source ${(c as any).source}`);
   }
+}
+
+// ---------- script bench (try a script against a hand-written response) ----------
+
+/**
+ * Dry-run a validation / capture / poll-stop script against a response the user
+ * types in, with no HTTP request involved.
+ *
+ * Why this exists: the alternative is sending the real request over and over to
+ * see whether an assertion fires, which is slow, needs the service to be up, and
+ * is impossible for the failure cases you actually want to assert on (a 500, a
+ * malformed body, the third poll attempt). Here the response IS the input.
+ *
+ * Runs the visual rules of the tab as well as the script, so what the bench
+ * reports is what the step would report — the same functions the real runner
+ * calls, not a re-implementation.
+ */
+export interface ScriptBenchInput {
+  mode: 'validate' | 'capture' | 'poll';
+  code: string;
+  /** Visual rules from the same tab. Assertions for 'validate', capture rules for 'capture'. */
+  visualAssertions?: Assertion[];
+  visualCaptures?: CaptureRule[];
+  response: {
+    status?: number;
+    statusText?: string;
+    /** Object or KV array; keys are lowercased, matching a real response. */
+    headers?: Record<string, string> | Array<{ key: string; value: string; enabled?: boolean }>;
+    timeMs?: number;
+    body?: string;
+  };
+  /** Working suite variables from the editor (may include unsaved edits). */
+  suiteVariables?: SuiteVariable[];
+  envId?: string | null;
+}
+
+export interface ScriptBenchResult {
+  mode: 'validate' | 'capture' | 'poll';
+  /** Visual + scripted assertions, in the order the runner would report them. */
+  assertions: AssertionResult[];
+  captured: CapturedValue[];
+  logs: string[];
+  /** True when a poll stop script called stop() — i.e. polling would end here. */
+  stopRequested: boolean;
+  /** Overall verdict: would this step be marked failed on this response? */
+  failed: boolean;
+  /** Script threw outside a test() — a syntax error, a bad JSON.parse, a timeout. */
+  error?: string;
+  /**
+   * Variables the script READ, with what they resolved to — so a wrong or
+   * undefined variable is visible without guessing. Written variables are in
+   * `captured`, not here.
+   */
+  usedVariables: Array<{ key: string; value: string }>;
+}
+
+function normalizeBenchHeaders(headers: ScriptBenchInput['response']['headers']): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!headers) return out;
+  if (Array.isArray(headers)) {
+    for (const h of headers) {
+      if (h?.enabled === false || !h?.key) continue;
+      out[String(h.key).toLowerCase()] = String(h.value ?? '');
+    }
+    return out;
+  }
+  for (const [k, v] of Object.entries(headers)) out[k.toLowerCase()] = String(v ?? '');
+  return out;
+}
+
+export function runScriptBench(input: ScriptBenchInput): ScriptBenchResult {
+  const suite: Suite = {
+    id: 'bench', name: 'bench', description: '', collectionId: null, steps: [],
+    variables: Array.isArray(input.suiteVariables) ? input.suiteVariables : [],
+    settings: defaultSettings(), defaultEnvId: input.envId ?? null, createdAt: '', updatedAt: '',
+  };
+  const scope = new VarScope(suite, input.envId);
+
+  const resp: SandboxResponse = {
+    status: Number.isFinite(input.response?.status) ? Number(input.response.status) : 200,
+    statusText: String(input.response?.statusText ?? 'OK'),
+    headers: normalizeBenchHeaders(input.response?.headers),
+    time: Number.isFinite(input.response?.timeMs) ? Number(input.response.timeMs) : 0,
+    bodyText: String(input.response?.body ?? ''),
+  };
+
+  const assertions: AssertionResult[] = [];
+  const captured: CapturedValue[] = [];
+  const usedKeys = new Set<string>();
+
+  if (input.mode === 'validate') {
+    for (const a of input.visualAssertions ?? []) assertions.push(runVisualAssertion(a, resp));
+  }
+  if (input.mode === 'capture') {
+    for (const c of input.visualCaptures ?? []) {
+      try {
+        const { value } = runVisualCapture(c, resp);
+        // Held in runtime scope even when the rule says 'global': a bench run
+        // must not write to global_variables. The REPORTED scope stays the
+        // rule's own, so the reader still sees where a real run would put it.
+        scope.set(c.targetVariable, value, c.scope === 'global' ? 'runtime' : c.scope);
+        captured.push({ key: c.targetVariable, value, scope: c.scope });
+      } catch (e: any) {
+        assertions.push({ name: `capture ${c.targetVariable}`, passed: false, message: e?.message || String(e) });
+      }
+    }
+  }
+
+  const outcome = runScript(input.code || '', resp, (k) => {
+    usedKeys.add(k);
+    return scope.get(k);
+  }, input.mode);
+  assertions.push(...outcome.tests);
+  for (const sv of outcome.setVariables) {
+    // Bench writes are NOT persisted: a global-scope capture here would edit
+    // real global variables from a form the user is only experimenting in.
+    captured.push({ key: sv.key, value: sv.value, scope: sv.scope });
+  }
+
+  const usedVariables = [...usedKeys].sort().map((key) => ({ key, value: scope.get(key) ?? '' }));
+  return {
+    mode: input.mode,
+    assertions,
+    captured,
+    logs: outcome.logs,
+    stopRequested: outcome.stopRequested,
+    failed: outcome.failed || assertions.some((a) => !a.passed),
+    ...(outcome.error ? { error: outcome.error } : {}),
+    usedVariables,
+  };
 }
 
 // ---------- step execution ----------
@@ -471,7 +645,7 @@ export function stopRun(runId: string): boolean {
   return true;
 }
 
-export function startRun(suite: Suite, cycles: number, stopOnFailure: boolean): Run {
+export function startRun(suite: Suite, cycles: number, stopOnFailure: boolean, envId?: string | null): Run {
   const run: Run = {
     id: newId(),
     suiteId: suite.id,
@@ -479,6 +653,8 @@ export function startRun(suite: Suite, cycles: number, stopOnFailure: boolean): 
     status: 'running',
     cycles,
     stopOnFailure,
+    envId: envId || null,
+    envName: envNameFor(envId),
     startedAt: new Date().toISOString(),
     finishedAt: null,
     cycleResults: [],
@@ -496,7 +672,7 @@ async function executeRun(run: Run, suite: Suite) {
   const startedMs = Date.now();
   try {
     for (let cycle = 1; cycle <= run.cycles && !ctrl.cancelled; cycle++) {
-      const scope = new VarScope(suite); // fresh scope per cycle; globals persist across cycles
+      const scope = new VarScope(suite, run.envId); // fresh scope per cycle; globals persist across cycles
       const cycleResult: CycleResult = { cycle, passed: true, steps: [] };
       run.cycleResults.push(cycleResult);
       let aborted = false;
@@ -544,12 +720,13 @@ function summarize(run: Run, durationMs: number): RunSummary {
 
 function persistRun(run: Run) {
   db.prepare(
-    `INSERT INTO runs (id, suite_id, suite_name, status, cycles, stop_on_failure, started_at, finished_at, cycle_results_json, summary_json)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO runs (id, suite_id, suite_name, status, cycles, stop_on_failure, env_id, env_name, started_at, finished_at, cycle_results_json, summary_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET status = excluded.status, finished_at = excluded.finished_at,
        cycle_results_json = excluded.cycle_results_json, summary_json = excluded.summary_json`,
   ).run(
     run.id, run.suiteId, run.suiteName, run.status, run.cycles, run.stopOnFailure ? 1 : 0,
+    run.envId, run.envName,
     run.startedAt, run.finishedAt, JSON.stringify(run.cycleResults), run.summary ? JSON.stringify(run.summary) : null,
   );
 }

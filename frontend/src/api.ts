@@ -30,8 +30,19 @@ export function backendPath(path: string): string {
   return getBackend() === 'go' ? '/_go' + path : path;
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(backendPath(path), {
+/**
+ * Prefix for one NAMED engine, ignoring the current selection.
+ *
+ * Needed because a live k6 run's output only exists in the process that spawned
+ * it: the run row says which engine that is, and the log poll has to go there
+ * even when the user is looking at the other one.
+ */
+export function prefixFor(b: Backend): string {
+  return b === 'go' ? '/_go' : '';
+}
+
+async function request<T>(method: string, path: string, body?: unknown, forceBackend?: Backend): Promise<T> {
+  const res = await fetch(forceBackend ? prefixFor(forceBackend) + path : backendPath(path), {
     method,
     headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -68,6 +79,8 @@ export async function pingBackend(b: Backend): Promise<boolean> {
 
 export const api = {
   get: <T>(path: string) => request<T>('GET', path),
+  /** GET from a specific engine rather than the selected one. See prefixFor. */
+  getOn: <T>(b: Backend, path: string) => request<T>('GET', path, undefined, b),
   post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body),

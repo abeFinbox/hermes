@@ -56,6 +56,29 @@ db.exec(`
     secret INTEGER NOT NULL DEFAULT 0
   );
 
+  -- ---- Environments: named, reusable variable sets (dev, staging, custom...) ----
+  -- One environment is chosen per run (suite default, overridable at launch) and
+  -- sits above the globals in precedence:
+  --   runtime > environment > global > suite
+  -- Kept in its own tables rather than a scope column on global_variables so that
+  -- deleting an environment cannot touch the globals every suite depends on.
+  -- Schema text is identical in backend-go/internal/store/store.go.
+  CREATE TABLE IF NOT EXISTS environments (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS environment_variables (
+    env_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    secret INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (env_id, key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_environment_variables_env ON environment_variables(env_id);
+
   CREATE TABLE IF NOT EXISTS files (
     id TEXT PRIMARY KEY,
     original_name TEXT NOT NULL,
@@ -162,6 +185,24 @@ function ensureCaptchaExemptColumn() {
   }
 }
 ensureCaptchaExemptColumn();
+
+/** Add a column if it isn't already there. Idempotent + shared with the Go backend. */
+function ensureColumn(table: string, name: string, decl: string) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === name)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${decl}`);
+  }
+}
+
+// --- Migration: environment selection (2.1) ---
+// A suite remembers its default environment; a run records the environment it
+// actually used, by id AND name, so the record survives the environment being
+// renamed or deleted. Mirrored in backend-go/internal/store/store.go.
+ensureColumn('suites', 'default_env_id', 'TEXT');
+ensureColumn('runs', 'env_id', 'TEXT');
+ensureColumn('runs', 'env_name', "TEXT NOT NULL DEFAULT ''");
+ensureColumn('hera_runs', 'env_id', 'TEXT');
+ensureColumn('hera_runs', 'env_name', "TEXT NOT NULL DEFAULT ''");
 
 export type Role = 'admin' | 'moderator' | 'npc';
 

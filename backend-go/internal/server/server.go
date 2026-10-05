@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,7 @@ func New() http.Handler {
 		r.Mount("/api/collections", collectionsRouter())
 		r.Mount("/api/suites", suitesRouter())
 		r.Mount("/api/variables", variablesRouter())
+		r.Mount("/api/environments", environmentsRouter())
 		r.Mount("/api/runs", runsRouter())
 		r.Mount("/api/docs", docsRouter())
 		r.Mount("/api/files", filesRouter())
@@ -200,15 +202,19 @@ func suitesRouter() chi.Router {
 func rowToSuite(scan func(dest ...interface{}) error) (*model.Suite, error) {
 	var (
 		id, name, description, stepsJSON, varsJSON, settingsJSON, createdAt, updatedAt string
-		collectionID                                                                   sql.NullString
+		collectionID, defaultEnvID                                                     sql.NullString
 	)
-	if err := scan(&id, &name, &description, &collectionID, &stepsJSON, &varsJSON, &settingsJSON, &createdAt, &updatedAt); err != nil {
+	if err := scan(&id, &name, &description, &collectionID, &stepsJSON, &varsJSON, &settingsJSON, &createdAt, &updatedAt, &defaultEnvID); err != nil {
 		return nil, err
 	}
 	s := &model.Suite{ID: id, Name: name, Description: description, CreatedAt: createdAt, UpdatedAt: updatedAt}
 	if collectionID.Valid {
 		v := collectionID.String
 		s.CollectionID = &v
+	}
+	if defaultEnvID.Valid && defaultEnvID.String != "" {
+		v := defaultEnvID.String
+		s.DefaultEnvID = &v
 	}
 	json.Unmarshal([]byte(stepsJSON), &s.Steps)
 	json.Unmarshal([]byte(varsJSON), &s.Variables)
@@ -224,7 +230,7 @@ func rowToSuite(scan func(dest ...interface{}) error) (*model.Suite, error) {
 	return s, nil
 }
 
-const suiteCols = "id, name, description, collection_id, steps_json, variables_json, settings_json, created_at, updated_at"
+const suiteCols = "id, name, description, collection_id, steps_json, variables_json, settings_json, created_at, updated_at, default_env_id"
 
 func getSuite(id string) (*model.Suite, error) {
 	row := store.DB.QueryRow("SELECT "+suiteCols+" FROM suites WHERE id = ?", id)
@@ -312,6 +318,9 @@ func updateSuite(w http.ResponseWriter, r *http.Request) {
 		Steps       *[]model.Step          `json:"steps"`
 		Variables   *[]model.SuiteVariable `json:"variables"`
 		Settings    map[string]interface{} `json:"settings"`
+		// Raw so absent (leave alone) stays distinct from null (clear it) —
+		// encoding/json decodes both to a nil pointer.
+		DefaultEnvID json.RawMessage `json:"defaultEnvId"`
 	}
 	if err := web.Decode(r, &body); err != nil {
 		web.Err(w, 400, "Invalid request body")
@@ -320,6 +329,22 @@ func updateSuite(w http.ResponseWriter, r *http.Request) {
 	if body.Name != nil && strings.TrimSpace(*body.Name) == "" {
 		web.Err(w, 400, "Suite name cannot be empty")
 		return
+	}
+	defaultEnvID := existing.DefaultEnvID
+	if len(body.DefaultEnvID) > 0 {
+		var next *string
+		if err := json.Unmarshal(body.DefaultEnvID, &next); err != nil {
+			web.Err(w, 400, "defaultEnvId must be an environment id or null")
+			return
+		}
+		if next != nil && *next == "" {
+			next = nil // treat "" like null, matching the Node route
+		}
+		if next != nil && store.GetEnvironment(*next) == nil {
+			web.Err(w, 404, "Environment not found")
+			return
+		}
+		defaultEnvID = next
 	}
 
 	name := existing.Name
@@ -356,9 +381,13 @@ func updateSuite(w http.ResponseWriter, r *http.Request) {
 	stepsJSON, _ := json.Marshal(steps)
 	varsJSON, _ := json.Marshal(vars)
 	settingsJSON, _ := json.Marshal(settings)
+	var envArg interface{}
+	if defaultEnvID != nil {
+		envArg = *defaultEnvID
+	}
 	if _, err := store.DB.Exec(
-		"UPDATE suites SET name = ?, description = ?, steps_json = ?, variables_json = ?, settings_json = ?, updated_at = ? WHERE id = ?",
-		name, description, string(stepsJSON), string(varsJSON), string(settingsJSON), nowISO(), id,
+		"UPDATE suites SET name = ?, description = ?, steps_json = ?, variables_json = ?, settings_json = ?, default_env_id = ?, updated_at = ? WHERE id = ?",
+		name, description, string(stepsJSON), string(varsJSON), string(settingsJSON), envArg, nowISO(), id,
 	); err != nil {
 		web.Err(w, 500, err.Error())
 		return
@@ -480,9 +509,13 @@ func duplicateSuite(w http.ResponseWriter, r *http.Request) {
 	if s.CollectionID != nil {
 		collID = *s.CollectionID
 	}
+	var envID interface{}
+	if s.DefaultEnvID != nil {
+		envID = *s.DefaultEnvID
+	}
 	store.DB.Exec(
-		"INSERT INTO suites (id, name, description, collection_id, steps_json, variables_json, settings_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		id, s.Name+" (copy)", s.Description, collID, string(stepsJSON), string(varsJSON), string(settingsJSON), now, now,
+		"INSERT INTO suites (id, name, description, collection_id, steps_json, variables_json, settings_json, default_env_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		id, s.Name+" (copy)", s.Description, collID, string(stepsJSON), string(varsJSON), string(settingsJSON), envID, now, now,
 	)
 	ns, _ := getSuite(id)
 	web.JSON(w, 201, ns)
@@ -540,6 +573,208 @@ func variablesRouter() chi.Router {
 		store.DB.Exec("DELETE FROM global_variables WHERE key = ?", chi.URLParam(r, "key"))
 		web.JSON(w, 200, map[string]bool{"ok": true})
 	})
+	return r
+}
+
+// ---------------- environments ----------------
+//
+// Named, reusable variable sets. Port of backend/src/routes/environments.ts —
+// same paths, same status codes, same messages.
+
+/*
+resolveEnvID decides which environment a run uses:
+
+	field absent    -> the suite's default
+	field null      -> no environment (an explicit override of that default)
+	field "<id>"    -> that environment
+
+The field is taken as raw JSON because encoding/json cannot tell absent from
+null: unmarshalling either into *string OR **string yields nil, which would
+silently turn "run this with no environment" back into the suite default.
+*/
+func resolveEnvID(raw json.RawMessage, suiteDefault *string) string {
+	if len(raw) == 0 {
+		if suiteDefault != nil {
+			return *suiteDefault
+		}
+		return ""
+	}
+	var s *string
+	if err := json.Unmarshal(raw, &s); err != nil || s == nil {
+		return ""
+	}
+	return *s
+}
+
+// validateEnvVars checks a posted variable array. Returns the cleaned list.
+func validateEnvVars(list []model.EnvironmentVariable) ([]model.EnvironmentVariable, string) {
+	out := make([]model.EnvironmentVariable, 0, len(list))
+	seen := map[string]bool{}
+	for _, v := range list {
+		if v.Key == "" || !varKeyRe.MatchString(v.Key) {
+			key := v.Key
+			if key == "" {
+				key = "(empty)"
+			}
+			return nil, "Invalid variable name: \"" + key + "\" — start with a letter/underscore, then letters, digits, _ . -"
+		}
+		if seen[v.Key] {
+			return nil, "Duplicate variable name: " + v.Key
+		}
+		seen[v.Key] = true
+		out = append(out, v)
+	}
+	return out, ""
+}
+
+func environmentsRouter() chi.Router {
+	r := chi.NewRouter()
+
+	r.Get("/", func(w http.ResponseWriter, _ *http.Request) {
+		web.JSON(w, 200, store.ListEnvironments())
+	})
+
+	r.Get("/{id}", func(w http.ResponseWriter, r *http.Request) {
+		env := store.GetEnvironment(chi.URLParam(r, "id"))
+		if env == nil {
+			web.Err(w, 404, "Environment not found")
+			return
+		}
+		web.JSON(w, 200, env)
+	})
+
+	r.Post("/", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Name        string                       `json:"name"`
+			Description string                       `json:"description"`
+			Variables   []model.EnvironmentVariable  `json:"variables"`
+		}
+		_ = web.Decode(r, &body)
+		name := strings.TrimSpace(body.Name)
+		if name == "" {
+			web.Err(w, 400, "Environment name is required")
+			return
+		}
+		vars, msg := validateEnvVars(body.Variables)
+		if msg != "" {
+			web.Err(w, 400, msg)
+			return
+		}
+		if store.EnvNameTaken(name, "") {
+			web.Err(w, 409, "An environment named \""+name+"\" already exists")
+			return
+		}
+		id := model.NewID()
+		now := nowISO()
+		if _, err := store.DB.Exec(
+			"INSERT INTO environments (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+			id, name, body.Description, now, now,
+		); err != nil {
+			web.Err(w, 500, err.Error())
+			return
+		}
+		if err := store.ReplaceEnvVars(id, vars); err != nil {
+			web.Err(w, 500, err.Error())
+			return
+		}
+		web.JSON(w, 201, store.GetEnvironment(id))
+	})
+
+	r.Put("/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		existing := store.GetEnvironment(id)
+		if existing == nil {
+			web.Err(w, 404, "Environment not found")
+			return
+		}
+		var body struct {
+			Name        *string                      `json:"name"`
+			Description *string                      `json:"description"`
+			Variables   *[]model.EnvironmentVariable `json:"variables"`
+		}
+		if err := web.Decode(r, &body); err != nil {
+			web.Err(w, 400, "Invalid request body")
+			return
+		}
+		name := existing.Name
+		if body.Name != nil {
+			name = strings.TrimSpace(*body.Name)
+			if name == "" {
+				web.Err(w, 400, "Environment name cannot be empty")
+				return
+			}
+			if store.EnvNameTaken(name, id) {
+				web.Err(w, 409, "An environment named \""+name+"\" already exists")
+				return
+			}
+		}
+		description := existing.Description
+		if body.Description != nil {
+			description = *body.Description
+		}
+		var vars []model.EnvironmentVariable
+		if body.Variables != nil {
+			cleaned, msg := validateEnvVars(*body.Variables)
+			if msg != "" {
+				web.Err(w, 400, msg)
+				return
+			}
+			vars = cleaned
+		}
+		if _, err := store.DB.Exec(
+			"UPDATE environments SET name = ?, description = ?, updated_at = ? WHERE id = ?",
+			name, description, nowISO(), id,
+		); err != nil {
+			web.Err(w, 500, err.Error())
+			return
+		}
+		if body.Variables != nil {
+			if err := store.ReplaceEnvVars(id, vars); err != nil {
+				web.Err(w, 500, err.Error())
+				return
+			}
+		}
+		web.JSON(w, 200, store.GetEnvironment(id))
+	})
+
+	r.Post("/{id}/duplicate", func(w http.ResponseWriter, r *http.Request) {
+		src := store.GetEnvironment(chi.URLParam(r, "id"))
+		if src == nil {
+			web.Err(w, 404, "Environment not found")
+			return
+		}
+		// First free "<name> (copy)", "<name> (copy 2)", ... — the name is UNIQUE.
+		name := src.Name + " (copy)"
+		for i := 2; store.EnvNameTaken(name, ""); i++ {
+			name = src.Name + " (copy " + strconv.Itoa(i) + ")"
+		}
+		id := model.NewID()
+		now := nowISO()
+		if _, err := store.DB.Exec(
+			"INSERT INTO environments (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+			id, name, src.Description, now, now,
+		); err != nil {
+			web.Err(w, 500, err.Error())
+			return
+		}
+		if err := store.ReplaceEnvVars(id, src.Variables); err != nil {
+			web.Err(w, 500, err.Error())
+			return
+		}
+		web.JSON(w, 201, store.GetEnvironment(id))
+	})
+
+	// Deleting an environment clears it from any suite pointing at it, so those
+	// suites fall back to globals + suite variables instead of a dangling id.
+	// Existing run rows keep env_name, which is why it is stored alongside env_id.
+	r.Delete("/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		store.DB.Exec("DELETE FROM environment_variables WHERE env_id = ?", id)
+		store.DB.Exec("DELETE FROM environments WHERE id = ?", id)
+		store.DB.Exec("UPDATE suites SET default_env_id = NULL WHERE default_env_id = ?", id)
+		web.JSON(w, 200, map[string]bool{"ok": true})
+	})
+
 	return r
 }
 

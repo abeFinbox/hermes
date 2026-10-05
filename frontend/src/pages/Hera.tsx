@@ -5,6 +5,7 @@ import { Info } from '../legends';
 import { useToast } from '../ui';
 import { isHeraActive, type HeraCapability, type HeraRunListItem } from '../types';
 import HeraLaunchForm from '../components/HeraLaunchForm';
+import HeraGlyph from '../components/HeraGlyph';
 
 /**
  * Hera — launch a load test, and the history of past ones.
@@ -18,7 +19,7 @@ export default function Hera() {
   const [caps, setCaps] = useState<HeraCapability | null>(null);
   const toast = useToast();
   const timer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
-  const [params] = useSearchParams(); // ?suiteId= arrives from the suite editor
+  const [params] = useSearchParams(); // ?suiteId= and ?envId= arrive from the suite editor
 
   const load = () => api.get<HeraRunListItem[]>('/api/hera').then(setItems).catch((e) => toast(e.message, 'error'));
 
@@ -48,7 +49,7 @@ export default function Hera() {
   return (
     <div>
       <div className="row wrap mb">
-        <h1 className="grow" style={{ margin: 0 }}>Hera — load testing</h1>
+        <h1 className="grow hera-title" style={{ margin: 0 }}><HeraGlyph size={22} title="Hera" /> Hera — load testing</h1>
         {caps?.version && <span className="muted mono">k6 {caps.version}{caps.platform ? ` · ${caps.platform}` : ''}</span>}
         <Info k="nav.hera" />
       </div>
@@ -80,6 +81,7 @@ export default function Hera() {
         <HeraLaunchForm
           caps={caps}
           initialSuiteId={params.get('suiteId')}
+          initialEnvId={params.get('envId')}
           activeRun={items.find((r) => isHeraActive(r.status)) ?? null}
           onLaunched={() => void load()}
         />

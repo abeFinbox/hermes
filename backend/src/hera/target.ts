@@ -1,4 +1,5 @@
 import type { HeraLimits } from './config.js';
+import { dynamicVarPlaceholder } from '../dynamic-vars.js';
 
 /**
  * Target validation: what Hera is allowed to point load at.
@@ -48,13 +49,45 @@ export interface TargetOptions {
 
 const TOKEN_RE = /\{\{\s*([^}\s]+)\s*\}\}/g;
 
-/** Mirrors VarScope.resolve: up to 5 passes, unknown tokens left literal. */
+/**
+ * Mirrors VarScope.resolve: up to 5 passes, unknown tokens left literal.
+ *
+ * Dynamic variables (`{{$guid}}` etc.) are left literal too, on purpose: this
+ * function feeds the preflight PREVIEW, and a URL that reads
+ * `.../items?id={{$guid}}` is more honest than one showing a UUID that will not
+ * be the one sent. Preflight already reports such tokens as runtime tokens.
+ * Host validation uses interpolateForTarget instead — see below.
+ */
 export function interpolate(text: string, vars: Record<string, string>): string {
   let out = String(text ?? '');
   for (let pass = 0; pass < 5; pass++) {
     if (!out.includes('{{')) break;
     const before = out;
     out = out.replace(TOKEN_RE, (whole, key: string) => (vars[key] === undefined ? whole : vars[key]));
+    if (out === before) break;
+  }
+  return out;
+}
+
+/**
+ * Interpolation used to decide WHERE a request goes.
+ *
+ * Same as interpolate, except dynamic variables collapse to a fixed placeholder
+ * (dynamicVarPlaceholder). Two reasons: a host must be validated and pinned to
+ * one IP before the run starts, which is impossible if part of it is random; and
+ * the target parity harness compares both engines byte for byte, so a live UUID
+ * in here would make every comparison fail.
+ */
+export function interpolateForTarget(text: string, vars: Record<string, string>): string {
+  let out = String(text ?? '');
+  for (let pass = 0; pass < 5; pass++) {
+    if (!out.includes('{{')) break;
+    const before = out;
+    out = out.replace(TOKEN_RE, (whole, key: string) => {
+      const placeholder = dynamicVarPlaceholder(key);
+      if (placeholder !== undefined) return placeholder;
+      return vars[key] === undefined ? whole : vars[key];
+    });
     if (out === before) break;
   }
   return out;
@@ -149,7 +182,7 @@ export function validateTarget(
   vars: Record<string, string>,
   opts: TargetOptions,
 ): Promise<ResolvedTarget> {
-  return validate(interpolate(rawUrl, vars), opts);
+  return validate(interpolateForTarget(rawUrl, vars), opts);
 }
 
 const TEMPLATED_ORIGIN =

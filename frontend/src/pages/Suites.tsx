@@ -5,6 +5,7 @@ import { Info } from '../legends';
 import { Modal, useToast, Confirm } from '../ui';
 import { useAuth } from '../App';
 import { permsFor } from '../perms';
+import HeraTear from '../components/HeraTear';
 import type { BundleImportResult, Suite, SuiteListItem } from '../types';
 
 export default function Suites() {
@@ -89,6 +90,8 @@ export default function Suites() {
           </tbody>
         </table>
       )}
+
+      {perms.canLoadTest && <HeraTear />}
 
       {creating && <CreateModal onClose={() => setCreating(false)} />}
       {migrating && <MigrateModal suite={migrating} isAdmin={perms.role === 'admin'} onClose={() => setMigrating(null)} />}

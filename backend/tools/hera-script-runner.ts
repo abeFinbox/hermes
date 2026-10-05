@@ -23,6 +23,10 @@ interface Case {
   filePaths?: Record<string, string>;
   fileMeta?: Record<string, { filename: string; mime: string }>;
   hostHeader?: string;
+  /** hostname -> IP for the options.hosts DNS pin. */
+  hosts?: Record<string, string>;
+  /** Failure-diagnostic knobs; omitted means off, as on a default instance. */
+  diag?: { enabled: boolean; max: number; body: boolean; bodyMax: number };
   suite: {
     name: string;
     settings?: Partial<Suite['settings']>;
@@ -75,6 +79,8 @@ for (const c of cases) {
     filePaths: c.filePaths || {},
     fileMeta: c.fileMeta || {},
     hostHeader: c.hostHeader,
+    hosts: c.hosts,
+    diag: c.diag,
   });
   chunks.push('===== CASE ' + c.name + ' =====\n' + script);
 }

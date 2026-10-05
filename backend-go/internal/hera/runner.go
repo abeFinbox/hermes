@@ -29,12 +29,16 @@ const (
 )
 
 type RequestedConfig struct {
-	SuiteID      string `json:"suiteId"`
-	Vus          int    `json:"vus"`
-	DurationSec  int    `json:"durationSec"`
-	ThinkTimeMs  int    `json:"thinkTimeMs"`
-	P95Ms        *int   `json:"p95Ms"`
-	ErrorRatePct *int   `json:"errorRatePct"`
+	SuiteID     string `json:"suiteId"`
+	Vus         int    `json:"vus"`
+	DurationSec int    `json:"durationSec"`
+	// Mode is the shape of the run; absent or unknown means flat.
+	Mode string `json:"mode"`
+	// RatePerSec is the target requests/s for "rate" mode; nil means the ceiling.
+	RatePerSec   *int `json:"ratePerSec"`
+	ThinkTimeMs  int  `json:"thinkTimeMs"`
+	P95Ms        *int `json:"p95Ms"`
+	ErrorRatePct *int `json:"errorRatePct"`
 }
 
 type AppliedConfig struct {
@@ -85,16 +89,27 @@ type PreflightResult struct {
 
 // ---------- variables & files ----------
 
-// BuildSeedVars merges globals first, then suite variables win (mirrors VarScope).
-func BuildSeedVars(suite model.Suite) map[string]string {
+// BuildSeedVars merges the layers, mirroring VarScope's
+// runtime > environment > global > suite.
+//
+// Written lowest-priority-first so each layer overwrites the one below it: suite
+// variables are the fallback a suite ships with, globals override them, and the
+// selected environment overrides both.
+//
+// Every virtual user starts from this map, so an environment chosen at launch is
+// what the whole load test runs against.
+func BuildSeedVars(suite model.Suite, envID string) map[string]string {
 	out := map[string]string{}
+	for _, v := range suite.Variables {
+		out[v.Key] = v.Value
+	}
 	if globals, err := store.GetGlobals(); err == nil {
 		for _, g := range globals {
 			out[g.Key] = g.Value
 		}
 	}
-	for _, v := range suite.Variables {
-		out[v.Key] = v.Value
+	for _, e := range store.GetEnvVars(envID) {
+		out[e.Key] = e.Value
 	}
 	return out
 }
@@ -154,27 +169,6 @@ func tokensIn(text string) []string {
 		}
 	}
 	return out
-}
-
-var originRe = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.\-]*://)([^/?#]*)(.*)$`)
-
-// PinnedURL replaces the origin with the resolved IP, keeping the rest of the
-// (possibly still templated) URL. The "pin" half of resolve-then-pin.
-func PinnedURL(interpolatedURL string, target ResolvedTarget) string {
-	m := originRe.FindStringSubmatch(interpolatedURL)
-	if m == nil || target.ResolvedIP == "" {
-		return interpolatedURL
-	}
-	ip := target.ResolvedIP
-	if strings.Contains(ip, ":") {
-		ip = "[" + ip + "]"
-	}
-	isDefaultPort := (target.Scheme == "http" && target.Port == "80") || (target.Scheme == "https" && target.Port == "443")
-	authority := ip
-	if !isDefaultPort {
-		authority = ip + ":" + target.Port
-	}
-	return m[1] + authority + m[3]
 }
 
 // ---------- caps ----------
@@ -241,11 +235,25 @@ func ClampConfig(req RequestedConfig, limits Limits, capMillicores int) ClampRes
 		errPct = &v
 	}
 
+	// An unknown mode falls back to flat rather than failing the launch: a client
+	// sending a mode this build does not have should still get a run.
+	mode := req.Mode
+	if mode != "" && !IsMode(mode) {
+		notes = append(notes, fmt.Sprintf("Unknown load mode %q — ran flat instead.", mode))
+	}
+	if !IsMode(mode) {
+		mode = "constant"
+	}
+	// Derived AFTER the vus/duration clamps, so a shape can never exceed a cap
+	// the flat run would have respected.
+	profile := DeriveProfile(mode, vus, dur, limits.MaxRps, req.RatePerSec)
+	notes = append(notes, profile.Notes...)
+
 	return ClampResult{
 		Applied: AppliedConfig{
 			SuiteID: req.SuiteID,
 			LoadConfig: LoadConfig{
-				Vus: vus, DurationSec: dur, Rps: limits.MaxRps,
+				Vus: vus, DurationSec: dur, Rps: limits.MaxRps, Mode: profile.Mode, RatePerSec: profile.RatePerSec,
 				ThinkTimeMs: think, P95Ms: p95, ErrorRatePct: errPct,
 			},
 		},
@@ -253,10 +261,31 @@ func ClampConfig(req RequestedConfig, limits Limits, capMillicores int) ClampRes
 	}
 }
 
+/*
+hostPort composes "host" or "host:port" for k6's DNS override map and for the
+origin strings shown and audited.
+
+IPv6 literals MUST be bracketed. Without this, localhost resolving to ::1
+produced the pair `localhost:4099 -> ::1:4099`, which k6 parses as host ::1 with
+NO port, then dials port 0 — every request in the run fails with "can't assign
+requested address" (errno 49). Verified on macOS, where localhost resolves to
+::1 first.
+*/
+func hostPort(host, port string) string {
+	h := host
+	if strings.Contains(h, ":") {
+		h = "[" + h + "]"
+	}
+	if port == "" {
+		return h
+	}
+	return h + ":" + port
+}
+
 // ---------- preflight ----------
 
-func Preflight(suite model.Suite, limits Limits, selfPort string) PreflightResult {
-	seed := BuildSeedVars(suite)
+func Preflight(suite model.Suite, limits Limits, selfPort string, envID string) PreflightResult {
+	seed := BuildSeedVars(suite, envID)
 	findings := []Finding{}
 	steps := []PreflightStep{}
 	hostOrder := []string{}
@@ -287,7 +316,7 @@ func Preflight(suite model.Suite, limits Limits, selfPort string) PreflightResul
 			ResolvedURL: resolved, UnresolvedTokens: tokensIn(resolved), Target: target,
 		})
 		if target.OK && target.Host != "" {
-			origin := fmt.Sprintf("%s://%s:%s", target.Scheme, target.Host, target.Port)
+			origin := target.Scheme + "://" + hostPort(target.Host, target.Port)
 			if h, ok := hostCounts[origin]; ok {
 				h.Requests++
 			} else {
@@ -393,6 +422,9 @@ type activeRun struct {
 	collector     *ProgressCollector
 	stopRequested bool
 	stopTimer     chan struct{}
+	// logs is the live k6 output, served by GET /api/hera/{id}/logs while this
+	// run is ours. Its own mutex guards it, so it is read without taking a.mu.
+	logs *LogRing
 }
 
 // requestStop marks the intent and forwards it if k6 is already running.
@@ -404,6 +436,20 @@ func (a *activeRun) requestStop() {
 	if h != nil {
 		h.Stop()
 	}
+}
+
+// logsOrNew returns the run's ring, creating one if the entry predates it or is
+// missing entirely. Nil-safe: a run can be gone by the time execute looks.
+func (a *activeRun) logsOrNew() *LogRing {
+	if a == nil {
+		return NewLogRing(GetLimits().LogLines, MaxLogRingBytes)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.logs == nil {
+		a.logs = NewLogRing(GetLimits().LogLines, MaxLogRingBytes)
+	}
+	return a.logs
 }
 
 // attach records the handle and reports whether a stop was already requested.
@@ -452,6 +498,9 @@ type StartRunInput struct {
 	ClampNotes []string
 	Actor      Actor
 	SelfPort   string
+	// EnvID selects the environment the VUs resolve variables against; "" means
+	// globals + suite only.
+	EnvID string
 }
 
 type StartRunResult struct {
@@ -502,7 +551,8 @@ func StartRun(in StartRunInput) StartRunResult {
 		return StartRunResult{Status: 503, Error: reason}
 	}
 
-	pre := Preflight(in.Suite, limits, in.SelfPort)
+	envName := store.EnvNameFor(in.EnvID)
+	pre := Preflight(in.Suite, limits, in.SelfPort, in.EnvID)
 	if !pre.OK {
 		msg := "Preflight failed."
 		for _, f := range pre.Findings {
@@ -532,18 +582,34 @@ func StartRun(in StartRunInput) StartRunResult {
 			"A load test is already running on this database (run %s). Only one runs at a time, so results stay comparable.", short)}
 	}
 
-	seed := BuildSeedVars(in.Suite)
+	seed := BuildSeedVars(in.Suite, in.EnvID)
 	files := CollectFiles(in.Suite)
-	pins := map[string]Pin{}
+	// Resolve-then-pin as a k6 DNS override: hostname -> validated IP. Keeping
+	// the hostname in the URL is what lets HTTPS work (a literal-IP URL fails
+	// cert validation — no IP SANs). Keyed by host[:non-default-port].
+	//
+	// When the key carries a port, the VALUE must carry the same port. k6 reads a
+	// port-less value as port 0 and then dials it, which fails with
+	// "can't assign requested address" (errno 49) on every request — verified.
+	pinHosts := map[string]string{}
 	for _, s := range pre.Steps {
-		if s.Target.OK && s.Target.Host != "" {
-			pins[s.StepID] = Pin{URL: PinnedURL(s.ResolvedURL, s.Target), HostHeader: s.Target.Host}
+		if s.Target.OK && s.Target.Host != "" && s.Target.ResolvedIP != "" {
+			isDefaultPort := (s.Target.Scheme == "http" && s.Target.Port == "80") ||
+				(s.Target.Scheme == "https" && s.Target.Port == "443")
+			key := hostPort(s.Target.Host, "")
+			val := hostPort(s.Target.ResolvedIP, "")
+			if !isDefaultPort {
+				key = hostPort(s.Target.Host, s.Target.Port)
+				val = hostPort(s.Target.ResolvedIP, s.Target.Port)
+			}
+			pinHosts[key] = val
 		}
 	}
 
 	script, metas := GenerateScript(GenerateInput{
 		Suite: in.Suite, SeedVars: seed, Load: in.Applied.LoadConfig,
-		FilePaths: files.Paths, FileMetas: files.Metas, Pins: pins,
+		FilePaths: files.Paths, FileMetas: files.Metas, Hosts: pinHosts,
+		Diag: &DiagConfig{Enabled: limits.Diag, Max: limits.DiagMax, Body: limits.DiagBody, BodyMax: limits.DiagBodyMax},
 	})
 
 	hosts := make([]string, 0, len(pre.Hosts))
@@ -570,37 +636,47 @@ func StartRun(in StartRunInput) StartRunResult {
 	if _, err := store.DB.Exec(
 		`INSERT INTO hera_runs (id, suite_id, suite_name, status, config_json, applied_config_json, target_hosts_json,
 		  k6_version, backend, owner_instance, heartbeat_at, started_at, samples_json, steps_json, confidence,
-		  created_by_user_id, created_by_username, created_by_role, source_ip)
-		 VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, 'go', ?, ?, ?, '[]', ?, 'unknown', ?, ?, ?, ?)`,
+		  created_by_user_id, created_by_username, created_by_role, source_ip, env_id, env_name)
+		 VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, 'go', ?, ?, ?, '[]', ?, 'unknown', ?, ?, ?, ?, ?, ?)`,
 		id, in.Suite.ID, in.Suite.Name, string(reqJSON), string(appliedJSON), string(hostsJSON),
 		derefVersion(cap), store.InstanceID, now, now, string(stepsJSON),
 		in.Actor.ID, in.Actor.Username, in.Actor.Role, in.Actor.IP,
+		envIDArg(in.EnvID), envName,
 	); err != nil {
 		ReleaseLock(id)
 		return StartRunResult{Status: 500, Error: err.Error()}
 	}
 
-	pinned := make([]string, 0, len(pins))
-	for _, p := range pins {
-		pinned = append(pinned, p.URL)
-	}
-	sort.Strings(pinned)
 	Audit("launch", id, in.Actor, in.Suite.ID, hosts, map[string]interface{}{
-		"applied": in.Applied, "clampNotes": in.ClampNotes, "pinned": pinned,
+		"applied": in.Applied, "clampNotes": in.ClampNotes, "pinned": pinHosts,
+		"envId": in.EnvID, "envName": envName,
 	})
-	log.Printf("[hera] launch run=%s by=%s(%s) ip=%s suite=%s vus=%d duration=%ds rps=%d hosts=%s",
-		id, in.Actor.Username, in.Actor.Role, in.Actor.IP, in.Suite.Name,
+	envLabel := envName
+	if envLabel == "" {
+		envLabel = "(none)"
+	}
+	log.Printf("[hera] launch run=%s by=%s(%s) ip=%s suite=%s env=%s vus=%d duration=%ds rps=%d hosts=%s",
+		id, in.Actor.Username, in.Actor.Role, in.Actor.IP, in.Suite.Name, envLabel,
 		in.Applied.Vus, in.Applied.DurationSec, in.Applied.Rps, strings.Join(hosts, ","))
 
 	// Register BEFORE spawning so an immediate stop is not lost in the gap
 	// between the 202 response and k6 actually starting.
 	activeMu.Lock()
-	activeRuns[id] = &activeRun{stopTimer: make(chan struct{})}
+	activeRuns[id] = &activeRun{stopTimer: make(chan struct{}), logs: NewLogRing(limits.LogLines, MaxLogRingBytes)}
 	activeMu.Unlock()
 
 	// Fire and forget; the UI polls GET /api/hera/:id.
 	go execute(id, script, in.Applied)
 	return StartRunResult{OK: true, ID: id}
+}
+
+// envIDArg keeps env_id NULL rather than an empty string when no environment
+// was chosen, so the column reads the same as the Node backend writes it.
+func envIDArg(envID string) interface{} {
+	if envID == "" {
+		return nil
+	}
+	return envID
 }
 
 func derefVersion(c Capability) string {
@@ -625,8 +701,17 @@ func execute(id, script string, applied AppliedConfig) {
 	}
 	collector := NewProgressCollector(port)
 	collector.Start()
+	// The ring was created in StartRun, before the spawn window, so a poll that
+	// lands during it gets an empty log rather than "run not found".
+	activeMu.Lock()
+	logs := activeRuns[id].logsOrNew()
+	activeMu.Unlock()
 	handle, err := SpawnK6(SpawnOptions{
 		Script: script, DurationSec: applied.DurationSec, Rps: applied.Rps, RunID: id, RestPort: port,
+		// A shaped run schedules itself from the script; passing --duration would
+		// flatten it back.
+		ScheduleInScript: SchedulesInScript(DeriveProfile(applied.Mode, applied.Vus, applied.DurationSec, applied.Rps, applied.RatePerSec)),
+		OnStderrLine:     logs.Push,
 	})
 	if err != nil {
 		collector.Stop()
@@ -738,6 +823,8 @@ type RunListItem struct {
 	SuiteID    string          `json:"suiteId"`
 	SuiteName  string          `json:"suiteName"`
 	Status     string          `json:"status"`
+	EnvID      *string         `json:"envId"`
+	EnvName    string          `json:"envName"`
 	Config     json.RawMessage `json:"config"`
 	StartedAt  string          `json:"startedAt"`
 	FinishedAt *string         `json:"finishedAt"`
@@ -759,7 +846,8 @@ type RunDetail struct {
 }
 
 const runCols = `id, suite_id, suite_name, status, config_json, applied_config_json, target_hosts_json,
- k6_version, backend, exit_code, started_at, finished_at, summary_json, samples_json, steps_json, stderr_tail, confidence`
+ k6_version, backend, exit_code, started_at, finished_at, summary_json, samples_json, steps_json, stderr_tail, confidence,
+ env_id, env_name`
 
 type rawRun struct {
 	item        RunListItem
@@ -776,14 +864,17 @@ func scanRun(scan func(dest ...interface{}) error) (*rawRun, error) {
 		k6Version, backend, samplesJSON, stepsJSON, stderr, confidence     string
 		exitCode                                                           *int
 		startedAt                                                          string
-		finishedAt, summaryJSON                                            *string
+		finishedAt, summaryJSON, envID                                     *string
+		envName                                                            string
 	)
 	if err := scan(&id, &suiteID, &suiteName, &status, &configJSON, &appliedJSON, &hostsJSON,
-		&k6Version, &backend, &exitCode, &startedAt, &finishedAt, &summaryJSON, &samplesJSON, &stepsJSON, &stderr, &confidence); err != nil {
+		&k6Version, &backend, &exitCode, &startedAt, &finishedAt, &summaryJSON, &samplesJSON, &stepsJSON, &stderr, &confidence,
+		&envID, &envName); err != nil {
 		return nil, err
 	}
 	item := RunListItem{
 		ID: id, SuiteID: suiteID, SuiteName: suiteName, Status: status,
+		EnvID: envID, EnvName: envName,
 		Config: json.RawMessage(appliedJSON), StartedAt: startedAt, FinishedAt: finishedAt,
 		Confidence: confidence, K6Version: k6Version, Backend: backend, ExitCode: exitCode,
 	}
@@ -845,6 +936,64 @@ func GetRun(id string, since *int) *RunDetail {
 		SampleCount:     len(all),
 		StderrTail:      r.stderr,
 	}
+}
+
+type RunLogs struct {
+	LogSlice
+	// RunBackend is which engine owns the row; the client uses it to re-target,
+	// not to error.
+	RunBackend string `json:"runBackend"`
+	// Live is true while these lines are still arriving.
+	Live bool `json:"live"`
+	// Available is false when this process cannot see the run's logs at all.
+	Available bool `json:"available"`
+	// Source is where these lines came from, and the ONLY safe way to merge them.
+	//
+	// "live" numbering is the run's monotonic cursor, so a client appends what it
+	// gets and passes Cursor back as ?sinceLine=. "tail" numbering restarts at 1
+	// — the persisted column is a 64KB suffix of the output, not the whole of it
+	// — so a client seeing "tail" must REPLACE its buffer rather than append, or
+	// it shows every line twice the moment a run finishes. "none" means no lines
+	// exist here at all; keep whatever you already have.
+	Source string `json:"source"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// GetRunLogs returns logs for one run, from memory while we own it and from
+// stderr_tail once it is over.
+//
+// The awkward case is a live run owned by the OTHER backend: both are up against
+// one database, and a ring lives in the process that spawned k6. There is
+// nothing to serve, so this says so explicitly instead of returning an empty
+// list that reads as "k6 printed nothing".
+func GetRunLogs(id string, sinceLine int) *RunLogs {
+	var backend, status, tail string
+	err := store.DB.QueryRow("SELECT backend, status, stderr_tail FROM hera_runs WHERE id = ?", id).
+		Scan(&backend, &status, &tail)
+	if err != nil {
+		return nil
+	}
+	activeMu.Lock()
+	entry := activeRuns[id]
+	activeMu.Unlock()
+	if entry != nil {
+		if ring := entry.logsOrNew(); ring != nil {
+			return &RunLogs{LogSlice: ring.Since(sinceLine), RunBackend: backend, Live: true, Available: true, Source: "live"}
+		}
+	}
+	for _, s := range store.HeraActiveStatuses {
+		if s == status {
+			return &RunLogs{
+				LogSlice:   LogSlice{Lines: []LogLine{}},
+				RunBackend: backend,
+				Live:       false,
+				Available:  false,
+				Source:     "none",
+				Reason:     "This run is owned by the " + backend + " backend. Live output is only available there.",
+			}
+		}
+	}
+	return &RunLogs{LogSlice: SliceFromTail(tail), RunBackend: backend, Live: false, Available: true, Source: "tail"}
 }
 
 func DeleteRun(id string) {

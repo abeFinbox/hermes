@@ -2,9 +2,21 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import { Info } from '../legends';
-import { useToast } from '../ui';
-import { isHeraActive, type HeraRun, type HeraTrend } from '../types';
+import { Modal, useToast } from '../ui';
+import { useAuth } from '../App';
+import { permsFor } from '../perms';
+import CurlBlock from '../components/CurlBlock';
+import {
+  isHeraActive,
+  type HeraLogLine,
+  type HeraLogsResponse,
+  type HeraRun,
+  type HeraStepCurl,
+  type HeraTrend,
+} from '../types';
 import { LatencyBars, TimeChart } from '../components/HeraCharts';
+import HeraGlyph from '../components/HeraGlyph';
+import LogViewer from '../components/LogViewer';
 
 /**
  * One load test: summary, four stacked time-series charts, the per-step
@@ -35,14 +47,46 @@ export default function HeraDetail() {
   const { id } = useParams();
   const [run, setRun] = useState<HeraRun | null>(null);
   const [stopping, setStopping] = useState(false);
+  const [logs, setLogs] = useState<HeraLogLine[]>([]);
+  const [logState, setLogState] = useState<{ dropped: number; notice?: string }>({ dropped: 0 });
+  const [curl, setCurl] = useState<{ stepId: string; loading: boolean; data?: HeraStepCurl } | null>(null);
+  const { user } = useAuth();
+  const perms = permsFor(user?.role, user?.isAdmin);
   const toast = useToast();
   const timer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  const logTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
+  /** Log cursor and the sample bookkeeping for incremental fetches. */
+  const cursor = useRef(0);
+  const held = useRef<{ lastT: number; count: number }>({ lastT: -1, count: 0 });
 
   useEffect(() => {
     const load = async () => {
       try {
-        const r = await api.get<HeraRun>(`/api/hera/${id}`);
-        setRun(r);
+        // Incremental: ask only for samples newer than the last one held. The
+        // integrity check below is what makes that safe.
+        const since = held.current.lastT >= 0 ? `?since=${held.current.lastT}` : '';
+        const r = await api.get<HeraRun>(`/api/hera/${id}${since}`);
+        setRun((prev) => {
+          const incoming = r.samples ?? [];
+          if (!prev || !since) {
+            held.current = { lastT: incoming.length ? incoming[incoming.length - 1].t : -1, count: incoming.length };
+            return r;
+          }
+          // The server decimates its sample blob past 256KB and rewrites `t` when
+          // the live buffer fills, so points we hold may no longer exist there.
+          // sampleCount is the arbiter: if ours plus theirs does not add up, our
+          // copy is stale — drop it and refetch whole on the next tick.
+          const merged = [...(prev.samples ?? []), ...incoming];
+          if (r.sampleCount !== held.current.count + incoming.length) {
+            held.current = { lastT: -1, count: 0 };
+            return { ...r, samples: prev.samples ?? [] };
+          }
+          held.current = {
+            lastT: merged.length ? merged[merged.length - 1].t : -1,
+            count: merged.length,
+          };
+          return { ...r, samples: merged };
+        });
         if (!isHeraActive(r.status) && timer.current) clearInterval(timer.current);
       } catch (e: any) {
         toast(e.message, 'error');
@@ -61,6 +105,53 @@ export default function HeraDetail() {
     };
   }, [id]);
 
+  /**
+   * Log poll, deliberately separate from the run poll: it targets a different
+   * engine (whichever owns the run) and it stops on a different condition (the
+   * first 'tail' response, which is the complete persisted record).
+   */
+  useEffect(() => {
+    if (!run) return;
+    const owner = run.backend === 'go' ? 'go' : 'node';
+    const stop = () => {
+      if (logTimer.current) clearInterval(logTimer.current);
+      logTimer.current = undefined;
+    };
+    const load = async () => {
+      try {
+        const r = await api.getOn<HeraLogsResponse>(owner, `/api/hera/${id}/logs?sinceLine=${cursor.current}`);
+        if (r.source === 'tail') {
+          // Renumbered from 1 — replace, never append. Then stop: this is final.
+          cursor.current = 0;
+          setLogs(r.lines);
+          setLogState({ dropped: 0, notice: undefined });
+          stop();
+          return;
+        }
+        if (r.source === 'none') {
+          setLogState({ dropped: 0, notice: r.reason });
+          return;
+        }
+        cursor.current = r.cursor;
+        if (r.lines.length) setLogs((prev) => [...prev, ...r.lines]);
+        setLogState({ dropped: r.dropped, notice: undefined });
+      } catch {
+        // A failed log poll must not toast: it fires every 2s, and the run
+        // payload's own poll already reports a backend that has gone away.
+        stop();
+      }
+    };
+    void load();
+    if (isHeraActive(run.status)) {
+      logTimer.current = setInterval(() => {
+        if (!document.hidden) void load();
+      }, POLL_MS);
+    }
+    return stop;
+    // run.backend and run.status are what matter; re-running on every poll would
+    // restart the interval endlessly.
+  }, [id, run?.backend, run?.status]);
+
   const stop = async () => {
     if (!run) return;
     setStopping(true);
@@ -78,6 +169,24 @@ export default function HeraDetail() {
       }
     } finally {
       setStopping(false);
+    }
+  };
+
+  /**
+   * Fetch on demand rather than with the run: this command carries real
+   * credentials, so it is neither persisted nor sent to anyone who cannot launch
+   * a run. Always from the owning engine, so the answer matches what ran.
+   */
+  const showCurl = async (stepId: string) => {
+    if (!run) return;
+    setCurl({ stepId, loading: true });
+    try {
+      const owner = run.backend === 'go' ? 'go' : 'node';
+      const r = await api.getOn<HeraStepCurl>(owner, `/api/hera/${run.id}/curl?stepId=${encodeURIComponent(stepId)}`);
+      setCurl({ stepId, loading: false, data: r });
+    } catch (e: any) {
+      setCurl(null);
+      toast(e.message, 'error');
     }
   };
 
@@ -105,8 +214,8 @@ export default function HeraDetail() {
   return (
     <div>
       <div className="row wrap mb">
-        <h1 className="grow" style={{ margin: 0 }}>
-          Load test — <Link to={`/suites/${run.suiteId}`}>{run.suiteName}</Link>{' '}
+        <h1 className="grow hera-title" style={{ margin: 0 }}>
+          <HeraGlyph size={20} title="Hera" /> Load test — <Link to={`/suites/${run.suiteId}`}>{run.suiteName}</Link>{' '}
           <span className={`chip status-${run.status}`}>{run.status}</span>
         </h1>
         {active && (
@@ -132,11 +241,16 @@ export default function HeraDetail() {
       )}
 
       <div className="card row wrap mb">
-        <span>VUs: <b>{run.config?.vus ?? '—'}</b></span>
+        {/* Absent on runs recorded before profiles existed, which were all flat. */}
+        <span>Mode: <b>{run.config?.mode ?? 'constant'}</b><Info k="hera.mode" /></span>
+        <span>{run.config?.mode === 'rate' ? 'Max VUs' : 'VUs'}: <b>{run.config?.vus ?? '—'}</b></span>
         <span>Duration: <b>{run.config?.durationSec ?? '—'}s</b></span>
         <span>Rate cap: <b>{run.config?.rps ?? '—'}/s</b></span>
         <span>p95 threshold: <b>{p95Threshold ? `${p95Threshold} ms` : 'none'}</b></span>
         <span>Started: <b>{new Date(run.startedAt).toLocaleString()}</b></span>
+        {/* Name as it was at launch — a renamed or deleted environment must not
+            make an old run unreadable. */}
+        <span>Environment: <b>{run.envName || 'none'}</b></span>
         <span>Engine: <b>{run.backend}</b>{run.k6Version ? ` · k6 ${run.k6Version}` : ''}</span>
         <span className="grow" />
         {active && <span className="muted">live — refreshing every 2s…</span>}
@@ -158,6 +272,17 @@ export default function HeraDetail() {
         <Tile label="Iterations" value={num(s?.iterations)} />
         <Tile label="Checks" value={s ? `${Math.round(s.checksPassed)}/${Math.round(s.checksTotal)}` : '—'} breach={!!s && s.checksTotal > s.checksPassed} />
         <Tile label="Script errors" value={num(s?.scriptErrors)} breach={!!s && s.scriptErrors > 0} />
+        {/* Only meaningful when something actually dropped — but then it is the
+            most important number on the page: in rate mode it means the target
+            could not absorb the arrival rate. */}
+        {!!s && s.droppedIterations > 0 && (
+          <Tile
+            label="Dropped iterations"
+            value={num(s.droppedIterations)}
+            sub="arrival rate exceeded capacity"
+            breach
+          />
+        )}
       </div>
 
       {!!s && s.suppressedGlobalWrites > 0 && (
@@ -227,6 +352,7 @@ export default function HeraDetail() {
               <th>Step</th><th className="num">Requests</th><th className="num">Err %</th>
               <th className="num">p50</th><th className="num">p95</th><th className="num">Max</th>
               <th className="num">Polls</th><th className="num">Wait p95</th>
+              {perms.canLoadTest && <th />}
             </tr>
           </thead>
           <tbody>
@@ -246,6 +372,17 @@ export default function HeraDetail() {
                   <td className="num">{st.latency ? num(st.latency.max, 1) : '—'}</td>
                   <td className="num">{st.pollAttempts ? num(st.pollAttempts.p95, 1) : '—'}</td>
                   <td className="num">{st.pollWaitMs ? num(st.pollWaitMs.p95, 0, ' ms') : '—'}</td>
+                  {perms.canLoadTest && (
+                    <td className="num">
+                      <button
+                        className="btn small"
+                        onClick={() => void showCurl(st.stepId)}
+                        title="Reproduce this step's request in a terminal"
+                      >
+                        ⧉ cURL
+                      </button>
+                    </td>
+                  )}
                 </tr>
               );
             })}
@@ -262,11 +399,49 @@ export default function HeraDetail() {
         </div>
       )}
 
-      {run.stderrTail && (
-        <details className="step-res mt">
-          <summary>k6 output</summary>
-          <div className="detail-body"><pre className="body-view">{run.stderrTail}</pre></div>
-        </details>
+      {/* Always rendered, and open while the run is live. The old truthiness gate
+          on stderrTail meant the panel did not exist during a run (the column is
+          only written at exit) and stayed absent for a run that passed quietly. */}
+      <details className="step-res mt" open={active}>
+        <summary>k6 output{logs.length > 0 ? ` (${logs.length.toLocaleString()} lines)` : ''}</summary>
+        <div className="detail-body">
+          {logs.length > 0 ? (
+            <LogViewer lines={logs} live={active} dropped={logState.dropped} notice={logState.notice} />
+          ) : (
+            <div className="muted">
+              {logState.notice
+                ? logState.notice
+                : active
+                  ? 'No output yet — k6 is starting up.'
+                  : 'k6 produced no output.'}
+            </div>
+          )}
+        </div>
+      </details>
+
+      {curl && (
+        <Modal title={`cURL — ${curl.data?.name ?? 'step'}`} onClose={() => setCurl(null)}>
+          {curl.loading ? (
+            <div className="muted">Building…</div>
+          ) : curl.data ? (
+            <>
+              {curl.data.staleWarning && (
+                <div className="hera-notice mb">
+                  The suite has been edited since this run, so this command reflects the request <b>as it is now</b>,
+                  not as it ran.
+                </div>
+              )}
+              {curl.data.unresolved.length > 0 && (
+                <div className="hera-notice info mb">
+                  Left as placeholders because they are captured during the run, not before it:{' '}
+                  <span className="mono">{curl.data.unresolved.map((u) => `{{${u}}}`).join(' ')}</span>. Substitute a
+                  real value before running.
+                </div>
+              )}
+              <CurlBlock curl={curl.data.curl} />
+            </>
+          ) : null}
+        </Modal>
       )}
     </div>
   );

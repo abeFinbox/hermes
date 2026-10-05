@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { db } from '../db.js';
 import { getSuite } from './suites.js';
-import { startRun, executeStep, stopRun, VarScope } from '../runner/executor.js';
+import { getEnvironment } from './environments.js';
+import { startRun, executeStep, stopRun, runScriptBench, VarScope } from '../runner/executor.js';
 import { defaultSettings, type Run, type Suite, type Step } from '../types.js';
 
 export const runsRouter = Router();
@@ -14,6 +15,8 @@ function rowToRun(row: any, includeResults: boolean): Run {
     status: row.status,
     cycles: row.cycles,
     stopOnFailure: !!row.stop_on_failure,
+    envId: row.env_id ?? null,
+    envName: row.env_name ?? '',
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     cycleResults: includeResults ? JSON.parse(row.cycle_results_json) : [],
@@ -21,15 +24,21 @@ function rowToRun(row: any, includeResults: boolean): Run {
   };
 }
 
-// Trigger: POST /api/runs  { suiteId, cycles?, stopOnFailure? }
+// Trigger: POST /api/runs  { suiteId, cycles?, stopOnFailure?, envId? }
+//
+// envId is a per-run override; omitting it falls back to the suite's default
+// environment. Sending null explicitly means "no environment" — that is why the
+// two cases are distinguished rather than collapsed with ||.
 runsRouter.post('/', (req, res) => {
-  const { suiteId, cycles, stopOnFailure } = req.body || {};
+  const { suiteId, cycles, stopOnFailure, envId } = req.body || {};
   const suite = getSuite(suiteId);
   if (!suite) return res.status(404).json({ error: 'Suite not found' });
   if (!suite.steps.some((s) => s.enabled)) return res.status(400).json({ error: 'Suite has no enabled steps' });
+  const chosenEnv = envId === undefined ? suite.defaultEnvId : envId ? String(envId) : null;
+  if (chosenEnv && !getEnvironment(chosenEnv)) return res.status(404).json({ error: 'Environment not found' });
   const n = Math.max(1, Math.min(100, Number(cycles) || suite.settings.defaultCycles || 1));
-  const run = startRun(suite, n, stopOnFailure !== undefined ? !!stopOnFailure : suite.settings.stopOnFailure);
-  res.status(202).json({ id: run.id, status: run.status });
+  const run = startRun(suite, n, stopOnFailure !== undefined ? !!stopOnFailure : suite.settings.stopOnFailure, chosenEnv);
+  res.status(202).json({ id: run.id, status: run.status, envId: run.envId, envName: run.envName });
 });
 
 /**
@@ -41,7 +50,7 @@ runsRouter.post('/', (req, res) => {
  * chain the next step. Nothing is persisted.
  */
 runsRouter.post('/step', async (req, res) => {
-  const { step, suiteVariables, settings } = req.body || {};
+  const { step, suiteVariables, settings, envId } = req.body || {};
   if (!step || typeof step !== 'object' || !step.request) {
     return res.status(400).json({ error: 'A step object with a request is required' });
   }
@@ -53,15 +62,53 @@ runsRouter.post('/step', async (req, res) => {
     steps: [step as Step],
     variables: Array.isArray(suiteVariables) ? suiteVariables : [],
     settings: { ...defaultSettings(), ...(settings || {}) },
+    defaultEnvId: envId ? String(envId) : null,
     createdAt: '',
     updatedAt: '',
   };
   try {
-    const scope = new VarScope(suite);
+    const scope = new VarScope(suite, suite.defaultEnvId);
     const result = await executeStep(step as Step, scope, suite, { withCurl: true, fullBody: true });
     res.json(result);
   } catch (e: any) {
     res.status(500).json({ error: e?.message || 'Step execution failed' });
+  }
+});
+
+/**
+ * Try a validation / capture / poll-stop script against a HAND-WRITTEN response.
+ *
+ * Body: { mode, code, visualAssertions?, visualCaptures?, response, suiteVariables?, envId? }
+ * where response is { status?, statusText?, headers?, timeMs?, body? }.
+ *
+ * No HTTP request is made and nothing is persisted — not even a global-scope
+ * capture (see runScriptBench). Listed in the execute whitelist in auth.ts, so
+ * read-only npc can use the bench: it is strictly less powerful than the "Send"
+ * they already have.
+ */
+runsRouter.post('/try-script', (req, res) => {
+  const { mode, code, visualAssertions, visualCaptures, response, suiteVariables, envId } = req.body || {};
+  if (mode !== 'validate' && mode !== 'capture' && mode !== 'poll') {
+    return res.status(400).json({ error: "mode must be one of 'validate', 'capture', 'poll'" });
+  }
+  if (typeof code !== 'string' && code !== undefined) {
+    return res.status(400).json({ error: 'code must be a string' });
+  }
+  if (envId && !getEnvironment(String(envId))) return res.status(404).json({ error: 'Environment not found' });
+  try {
+    res.json(
+      runScriptBench({
+        mode,
+        code: String(code ?? ''),
+        visualAssertions: Array.isArray(visualAssertions) ? visualAssertions : [],
+        visualCaptures: Array.isArray(visualCaptures) ? visualCaptures : [],
+        response: response && typeof response === 'object' ? response : {},
+        suiteVariables: Array.isArray(suiteVariables) ? suiteVariables : [],
+        envId: envId ? String(envId) : null,
+      }),
+    );
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'Script bench failed' });
   }
 });
 

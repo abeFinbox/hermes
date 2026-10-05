@@ -22,9 +22,16 @@ import (
 //  4. numbers are emitted via intLiteral, never a float formatter
 
 type LoadConfig struct {
-	Vus          int  `json:"vus"`
-	DurationSec  int  `json:"durationSec"`
-	Rps          int  `json:"rps"`
+	Vus         int `json:"vus"`
+	DurationSec int `json:"durationSec"`
+	Rps         int `json:"rps"`
+	// Mode is the shape of the run. Empty means "constant", which is what every
+	// run was before profiles existed — so an old stored config still generates
+	// the same script.
+	Mode string `json:"mode,omitempty"`
+	// RatePerSec is the target arrival rate for "rate" mode; nil means the server
+	// ceiling.
+	RatePerSec   *int `json:"ratePerSec,omitempty"`
 	ThinkTimeMs  int  `json:"thinkTimeMs"`
 	P95Ms        *int `json:"p95Ms"`
 	ErrorRatePct *int `json:"errorRatePct"`
@@ -54,17 +61,27 @@ type GenerateInput struct {
 	FileMetas map[string]FileMeta
 	// HostHeader is an optional Host override from resolve-then-pin.
 	HostHeader string
-	// Pins carries per-step resolve-then-pin. The URL has its ORIGIN replaced by
-	// the literal resolved IP (path and query keep their {{tokens}}), and
-	// HostHeader carries the original hostname — so k6 never performs its own
-	// lookup and cannot be rebound between validation and execution. Keyed by
-	// step id, because one suite can span several origins.
-	Pins map[string]Pin
+	// Hosts is resolve-then-pin via k6's own DNS override (options.hosts):
+	// hostname ("host" or "host:port") -> validated IP. k6 consults it before
+	// any lookup, so the run cannot be rebound — but the hostname stays in the
+	// URL, so SNI and TLS certificate validation still work (a literal-IP URL
+	// breaks HTTPS: the cert has no IP SANs).
+	Hosts map[string]string
+	// Diag carries failure-diagnostic settings, from server config rather than
+	// the suite.
+	//
+	// Deliberately here and not in LoadConfig: the load config is persisted as
+	// applied_config_json and echoed into the launch audit row, and an operator
+	// knob does not belong in either. Nil keeps diagnostics off, which is what
+	// the parity harness does for the pre-existing fixture cases.
+	Diag *DiagConfig
 }
 
-type Pin struct {
-	URL        string `json:"url"`
-	HostHeader string `json:"hostHeader"`
+type DiagConfig struct {
+	Enabled bool `json:"enabled"`
+	Max     int  `json:"max"`
+	Body    bool `json:"body"`
+	BodyMax int  `json:"bodyMax"`
 }
 
 // jsLiteral is a deterministic JS string literal. Deliberately not
@@ -170,18 +187,13 @@ func StepMetas(s model.Suite) []StepMeta {
 }
 
 func emitStepDef(step model.Step, meta StepMeta, in GenerateInput) string {
-	pin, pinned := in.Pins[step.ID]
 	L := []string{}
 	L = append(L, "  {")
 	L = append(L, "    stepId: "+jsLiteral(meta.StepID)+",")
 	L = append(L, "    tag: "+jsLiteral(meta.Tag)+",")
 	L = append(L, "    name: "+jsLiteral(meta.Name)+",")
 	L = append(L, "    method: "+jsLiteral(meta.Method)+",")
-	stepURL := step.Request.URL
-	if pinned {
-		stepURL = pin.URL
-	}
-	L = append(L, "    url: "+jsLiteral(stepURL)+",")
+	L = append(L, "    url: "+jsLiteral(step.Request.URL)+",")
 
 	hs := []string{}
 	for _, h := range step.Request.Headers {
@@ -261,9 +273,6 @@ func emitStepDef(step model.Step, meta StepMeta, in GenerateInput) string {
 	}
 
 	hostHeader := in.HostHeader
-	if pinned {
-		hostHeader = pin.HostHeader
-	}
 	if hostHeader != "" {
 		L = append(L, "    hostHeader: "+jsLiteral(hostHeader)+",")
 	} else {
@@ -301,6 +310,14 @@ func GenerateScript(in GenerateInput) (string, []StepMeta) {
 	L = append(L, "var HERA_STOP_ON_FAILURE = "+boolLiteral(in.Suite.Settings.StopOnFailure)+";")
 	L = append(L, "var HERA_RUN_CAPTURES_ON_FAILURE = "+boolLiteral(in.Suite.Settings.RunCapturesOnFailure)+";")
 	L = append(L, "var HERA_THINK_TIME_MS = "+intLiteral(load.ThinkTimeMs)+";")
+	diag := in.Diag
+	if diag == nil {
+		diag = &DiagConfig{}
+	}
+	L = append(L, "var HERA_DIAG = "+boolLiteral(diag.Enabled)+";")
+	L = append(L, "var HERA_DIAG_MAX = "+intLiteral(diag.Max)+";")
+	L = append(L, "var HERA_DIAG_BODY = "+boolLiteral(diag.Body)+";")
+	L = append(L, "var HERA_DIAG_BODY_MAX = "+intLiteral(diag.BodyMax)+";")
 	L = append(L, "")
 
 	// Files opened at init scope — k6 requires open() there. The bytes already
@@ -372,11 +389,55 @@ func GenerateScript(in GenerateInput) (string, []StepMeta) {
 		th = append(th, "  'http_req_failed': ['rate<"+percentLiteral(*load.ErrorRatePct)+"'],")
 	}
 
+	// The profile decides HOW the run is scheduled. Exactly one of scenarios,
+	// stages or vus+duration is emitted: k6 accepts more than one and then
+	// silently prefers a different combination than the reader expects.
+	mode := load.Mode
+	if !IsMode(mode) {
+		mode = "constant"
+	}
+	profile := DeriveProfile(mode, load.Vus, load.DurationSec, load.Rps, load.RatePerSec)
+
 	L = append(L, "export var options = {")
-	L = append(L, "  vus: "+intLiteral(load.Vus)+",")
-	L = append(L, "  duration: '"+intLiteral(load.DurationSec)+"s',")
+	if profile.RatePerSec != nil {
+		L = append(L, "  scenarios: {")
+		L = append(L, "    hera: {")
+		// Arrival-rate, not VU-driven: throughput stays fixed while the target
+		// slows down, which is the only way to see a queue actually build.
+		L = append(L, "      executor: 'constant-arrival-rate',")
+		L = append(L, "      rate: "+intLiteral(*profile.RatePerSec)+",")
+		L = append(L, "      timeUnit: '1s',")
+		L = append(L, "      duration: '"+intLiteral(profile.DurationSec)+"s',")
+		L = append(L, "      preAllocatedVUs: "+intLiteral(profile.Vus)+",")
+		L = append(L, "      maxVUs: "+intLiteral(profile.Vus)+",")
+		L = append(L, "    },")
+		L = append(L, "  },")
+	} else if len(profile.Stages) > 0 {
+		L = append(L, "  stages: [")
+		for _, s := range profile.Stages {
+			L = append(L, "    { duration: '"+intLiteral(s.DurationSec)+"s', target: "+intLiteral(s.Target)+" },")
+		}
+		L = append(L, "  ],")
+	} else {
+		L = append(L, "  vus: "+intLiteral(profile.Vus)+",")
+		L = append(L, "  duration: '"+intLiteral(profile.DurationSec)+"s',")
+	}
 	L = append(L, "  rps: "+intLiteral(load.Rps)+",")
 	L = append(L, "  maxRedirects: 0,")
+	// Resolve-then-pin as a k6 DNS override: each hostname is forced to the IP we
+	// validated, but the hostname stays in the request so TLS/SNI still work.
+	hostKeys := make([]string, 0, len(in.Hosts))
+	for h := range in.Hosts {
+		hostKeys = append(hostKeys, h)
+	}
+	sort.Strings(hostKeys)
+	if len(hostKeys) > 0 {
+		L = append(L, "  hosts: {")
+		for _, h := range hostKeys {
+			L = append(L, "    "+jsLiteral(h)+": "+jsLiteral(in.Hosts[h])+",")
+		}
+		L = append(L, "  },")
+	}
 	L = append(L, "  summaryTrendStats: ['min', 'avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],")
 	L = append(L, "  thresholds: {")
 	L = append(L, strings.Join(th, "\n"))

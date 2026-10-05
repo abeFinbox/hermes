@@ -187,7 +187,41 @@ diff /tmp/n.txt /tmp/g.txt && echo "script parity OK"
 cd backend      && npx tsx tools/hera-target-runner.ts ../backend-go/testdata/hera-target-cases.json > /tmp/nt.txt
 cd ../backend-go && go run ./cmd/hera-target-runner ./testdata/hera-target-cases.json > /tmp/gt.txt
 diff /tmp/nt.txt /tmp/gt.txt && echo "rejection parity OK"
+
+# 3. and identical per-step cURL text. This command carries real credentials and
+#    is what someone pastes into a terminal to reproduce a failing step, so a
+#    quoting or percent-encoding divergence means one engine hands out a command
+#    that does not reproduce the run.
+cd backend      && npx tsx tools/hera-curl-runner.ts ../backend-go/testdata/hera-curl-cases.json > /tmp/nc.txt
+cd ../backend-go && go run ./cmd/hera-curl-runner ./testdata/hera-curl-cases.json > /tmp/gc.txt
+diff /tmp/nc.txt /tmp/gc.txt && echo "curl parity OK"
 ```
+
+Then the live log route, which needs a running server and an in-flight run. It is
+the one place the two backends deliberately answer *differently*: a live run's
+output exists only in the process that spawned k6, so ask the engine named in
+`runBackend`.
+
+```bash
+# while a run is in flight (id from POST /api/hera):
+curl -s "localhost:8080/api/hera/$RUN/logs?sinceLine=0"      # owning lane: source=live
+curl -s "localhost:8080/_go/api/hera/$RUN/logs?sinceLine=0"  # other lane: 200, source=none
+# re-issue with ?sinceLine=<cursor from the last response> — only new lines come back.
+# after it finishes, EITHER lane answers with source=tail, renumbered from 1:
+# a client must REPLACE its buffer on 'tail', not append.
+```
+
+A step that ends non-2xx also emits one `HERA_DIAG step=… status=… code=… body=…`
+line per VU (up to `HERA_DIAG_MAX`). If those lines are absent on a failing run,
+check `HERA_DIAG` is not set to `0`. The body is on by default and truncated to
+`HERA_DIAG_BODY_MAX`; **set `HERA_DIAG_BODY=0` on any instance pointed at
+production data**, because those lines are persisted in the run row and therefore
+put response payloads at rest until the run is deleted.
+
+`GET /api/hera/:id/curl?stepId=…` returns a paste-runnable command for one step.
+It resolves real values including secret variables — deliberately, since a masked
+`Authorization` reproduces the wrong failure — so it is admin-gated
+(`HERA_ALLOW_MODERATOR` extends it, exactly like launching) and never persisted.
 
 Then a live smoke test against the built-in demo API, which is what the default
 configuration permits anyway — no external service, no credentials:

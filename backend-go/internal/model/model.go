@@ -114,14 +114,36 @@ type Suite struct {
 	Steps        []Step          `json:"steps"`
 	Variables    []SuiteVariable `json:"variables"`
 	Settings     SuiteSettings   `json:"settings"`
-	CreatedAt    string          `json:"createdAt"`
-	UpdatedAt    string          `json:"updatedAt"`
+	// DefaultEnvID is the environment pre-selected for runs of this suite.
+	DefaultEnvID *string `json:"defaultEnvId"`
+	CreatedAt    string  `json:"createdAt"`
+	UpdatedAt    string  `json:"updatedAt"`
 }
 
 type GlobalVariable struct {
 	Key    string `json:"key"`
 	Value  string `json:"value"`
 	Secret bool   `json:"secret"`
+}
+
+// EnvironmentVariable is one variable inside an environment — same shape as a
+// global or suite variable.
+type EnvironmentVariable struct {
+	Key    string `json:"key"`
+	Value  string `json:"value"`
+	Secret bool   `json:"secret"`
+}
+
+// Environment is a named, reusable variable set (dev, staging, custom...).
+// The most specific layer below runtime captures:
+// runtime > environment > global > suite.
+type Environment struct {
+	ID          string                `json:"id"`
+	Name        string                `json:"name"`
+	Description string                `json:"description"`
+	Variables   []EnvironmentVariable `json:"variables"`
+	CreatedAt   string                `json:"createdAt"`
+	UpdatedAt   string                `json:"updatedAt"`
 }
 
 type AssertionResult struct {
@@ -201,6 +223,11 @@ type Run struct {
 	Status       string        `json:"status"` // running | passed | failed | error | stopped
 	Cycles       int           `json:"cycles"`
 	StopOnFailure bool         `json:"stopOnFailure"`
+	// EnvID / EnvName record the environment this run resolved variables
+	// against. The name is stored too, so the record stays readable after the
+	// environment is renamed or deleted.
+	EnvID        *string       `json:"envId"`
+	EnvName      string        `json:"envName"`
 	StartedAt    string        `json:"startedAt"`
 	FinishedAt   *string       `json:"finishedAt"`
 	CycleResults []CycleResult `json:"cycleResults"`

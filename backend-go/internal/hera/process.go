@@ -1,6 +1,7 @@
 package hera
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -81,6 +82,15 @@ type SpawnOptions struct {
 	// RestPort is the loopback port for k6's REST API, used to sample live
 	// progress. Zero leaves the API off entirely (k6's default).
 	RestPort int
+	// ScheduleInScript means the script's own options carry the schedule (stages
+	// or scenarios), so no --duration flag may be passed: on the CLI it wins and
+	// flattens the shape.
+	ScheduleInScript bool
+	// OnStderrLine receives every complete k6 output line as it arrives, for the
+	// live log ring. It runs on the stderr reader goroutine, so it must not
+	// block. The stderr tail is accumulated independently: this callback is
+	// additive and can be nil.
+	OnStderrLine func(string)
 }
 
 // StatusForExit derives the run status from how k6 exited.
@@ -136,8 +146,18 @@ func SpawnK6(opts SpawnOptions) (*RunHandle, error) {
 		"-", // read the script from stdin
 		"--quiet",
 		"--no-usage-report",
-		"--duration", fmt.Sprintf("%ds", opts.DurationSec),
+		// One JSON object per line. The default logfmt escapes the message, so a
+		// diagnostic containing a response body arrives double-quoted and is
+		// painful to read in the UI; this makes level/time/msg addressable.
+		"--log-format", "json",
 		"--rps", fmt.Sprintf("%d", opts.Rps),
+	}
+	// --duration on the CLI OVERRIDES options.stages and options.scenarios, so a
+	// shaped run would silently flatten back to a plain one. The script carries
+	// the schedule in those modes; the watchdog below still uses DurationSec,
+	// which the profile guarantees is the total.
+	if !opts.ScheduleInScript {
+		args = append(args, "--duration", fmt.Sprintf("%ds", opts.DurationSec))
 	}
 	if opts.RestPort > 0 {
 		// 127.0.0.1 ONLY. k6's REST API is unauthenticated and can change VU
@@ -233,13 +253,36 @@ func SpawnK6(opts SpawnOptions) (*RunHandle, error) {
 
 	stderrCh := make(chan string, 1)
 	go func() {
-		data, _ := io.ReadAll(stderrPipe)
-		s := string(data)
-		if len(s) > MaxStderrBytes {
-			// keep the TAIL: that is where the error is
-			s = s[len(s)-MaxStderrBytes:]
+		// Read line by line so the log ring can see output as it happens, while
+		// still accumulating the exact byte stream for the tail.
+		//
+		// bufio.Reader.ReadString, NOT bufio.Scanner: Scanner errors out on a
+		// token longer than its 64KB buffer and would then silently stop reading
+		// stderr for the rest of the run, losing the tail — the one place the
+		// error actually lives.
+		r := bufio.NewReader(stderrPipe)
+		var buf []byte
+		emit := func(chunk string) {
+			if opts.OnStderrLine == nil {
+				return
+			}
+			opts.OnStderrLine(strings.TrimSuffix(chunk, "\n"))
 		}
-		stderrCh <- s
+		for {
+			chunk, rerr := r.ReadString('\n')
+			if chunk != "" {
+				buf = append(buf, chunk...)
+				if len(buf) > MaxStderrBytes {
+					// keep the TAIL: that is where the error is
+					buf = buf[len(buf)-MaxStderrBytes:]
+				}
+				emit(chunk)
+			}
+			if rerr != nil {
+				break
+			}
+		}
+		stderrCh <- string(buf)
 	}()
 
 	// Feed the script in and close stdin so k6 starts.

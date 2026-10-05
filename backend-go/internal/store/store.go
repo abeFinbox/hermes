@@ -58,6 +58,25 @@ CREATE TABLE IF NOT EXISTS global_variables (
   value TEXT NOT NULL,
   secret INTEGER NOT NULL DEFAULT 0
 );
+-- Environments: named, reusable variable sets (dev, staging, custom...). One is
+-- chosen per run and sits above the globals in precedence:
+--   runtime > environment > global > suite
+-- Schema text is identical in backend/src/db.ts.
+CREATE TABLE IF NOT EXISTS environments (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS environment_variables (
+  env_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  secret INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (env_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_environment_variables_env ON environment_variables(env_id);
 CREATE TABLE IF NOT EXISTS files (
   id TEXT PRIMARY KEY,
   original_name TEXT NOT NULL,
@@ -176,6 +195,19 @@ func Init() error {
 	}
 	if err := ensureColumn("captcha_exempt", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
+	}
+	// Environment selection (2.1): a suite remembers its default environment, a
+	// run records the one it used. Mirrors backend/src/db.ts.
+	for _, m := range []struct{ table, name, decl string }{
+		{"suites", "default_env_id", "TEXT"},
+		{"runs", "env_id", "TEXT"},
+		{"runs", "env_name", "TEXT NOT NULL DEFAULT ''"},
+		{"hera_runs", "env_id", "TEXT"},
+		{"hera_runs", "env_name", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureTableColumn(m.table, m.name, m.decl); err != nil {
+			return err
+		}
 	}
 	if err := ReapStaleHeraRuns(); err != nil {
 		return err
@@ -297,6 +329,35 @@ func ensureColumn(name, decl string) error {
 	return err
 }
 
+// ensureTableColumn adds a column to any table if it isn't already present
+// (idempotent, shared with the Node backend's ensureColumn in db.ts).
+func ensureTableColumn(table, name, decl string) error {
+	rows, err := DB.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	has := false
+	for rows.Next() {
+		var cid int
+		var cname, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &cname, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if cname == name {
+			has = true
+		}
+	}
+	rows.Close()
+	if has {
+		return nil
+	}
+	_, err = DB.Exec("ALTER TABLE " + table + " ADD COLUMN " + name + " " + decl)
+	return err
+}
+
 func initSecret() error {
 	if s := os.Getenv("JWT_SECRET"); s != "" {
 		JWTSecret = s
@@ -379,6 +440,108 @@ func SetGlobal(key, value string, secret bool) error {
 		key, value, s,
 	)
 	return err
+}
+
+// ---- environments (named variable sets, shared by executor + hera + routes) ----
+
+// GetEnvVars returns one environment's variables. A missing id yields an empty
+// slice rather than an error: a deleted environment must degrade to "no
+// environment" instead of breaking every run that referenced it.
+func GetEnvVars(envID string) []model.EnvironmentVariable {
+	out := []model.EnvironmentVariable{}
+	if envID == "" {
+		return out
+	}
+	rows, err := DB.Query("SELECT key, value, secret FROM environment_variables WHERE env_id = ? ORDER BY key", envID)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var v model.EnvironmentVariable
+		var secret int
+		if err := rows.Scan(&v.Key, &v.Value, &secret); err != nil {
+			return out
+		}
+		v.Secret = secret != 0
+		out = append(out, v)
+	}
+	return out
+}
+
+// GetEnvironment loads one environment with its variables; nil when unknown.
+func GetEnvironment(id string) *model.Environment {
+	var e model.Environment
+	err := DB.QueryRow("SELECT id, name, description, created_at, updated_at FROM environments WHERE id = ?", id).
+		Scan(&e.ID, &e.Name, &e.Description, &e.CreatedAt, &e.UpdatedAt)
+	if err != nil {
+		return nil
+	}
+	e.Variables = GetEnvVars(e.ID)
+	return &e
+}
+
+// ListEnvironments returns every environment, name-ordered, with variables.
+func ListEnvironments() []model.Environment {
+	out := []model.Environment{}
+	rows, err := DB.Query("SELECT id, name, description, created_at, updated_at FROM environments ORDER BY name")
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e model.Environment
+		if err := rows.Scan(&e.ID, &e.Name, &e.Description, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			return out
+		}
+		out = append(out, e)
+	}
+	rows.Close()
+	for i := range out {
+		out[i].Variables = GetEnvVars(out[i].ID)
+	}
+	return out
+}
+
+// EnvNameFor returns an environment's name for a run record — "" when nothing
+// was selected or the id is unknown.
+func EnvNameFor(envID string) string {
+	if envID == "" {
+		return ""
+	}
+	var name string
+	if err := DB.QueryRow("SELECT name FROM environments WHERE id = ?", envID).Scan(&name); err != nil {
+		return ""
+	}
+	return name
+}
+
+// ReplaceEnvVars swaps an environment's whole variable set in one go.
+func ReplaceEnvVars(envID string, list []model.EnvironmentVariable) error {
+	if _, err := DB.Exec("DELETE FROM environment_variables WHERE env_id = ?", envID); err != nil {
+		return err
+	}
+	for _, v := range list {
+		s := 0
+		if v.Secret {
+			s = 1
+		}
+		if _, err := DB.Exec(
+			"INSERT INTO environment_variables (env_id, key, value, secret) VALUES (?, ?, ?, ?)",
+			envID, v.Key, v.Value, s,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// EnvNameTaken reports whether another environment already uses this name
+// (environments.name is UNIQUE).
+func EnvNameTaken(name, exceptID string) bool {
+	var id string
+	err := DB.QueryRow("SELECT id FROM environments WHERE name = ? AND id != ?", name, exceptID).Scan(&id)
+	return err == nil
 }
 
 // ---- files ----

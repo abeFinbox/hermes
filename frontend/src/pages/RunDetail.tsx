@@ -88,6 +88,9 @@ export default function RunDetail() {
       <div className="card row wrap mb">
         <span>Cycles: <b>{run.cycles}</b></span>
         <span>Stop on failure: <b>{run.stopOnFailure ? 'yes' : 'no'}</b></span>
+        {/* Name as it was at launch — the environment may since have been
+            renamed or deleted, and the record has to stay readable. */}
+        <span>Environment: <b>{run.envName || 'none'}</b></span>
         <span>Started: <b>{new Date(run.startedAt).toLocaleString()}</b></span>
         {run.summary && (
           <>

@@ -35,6 +35,31 @@ function heraFmt(v) {
   return typeof v === 'string' ? '"' + v + '"' : JSON.stringify(v);
 }
 
+// Dynamic variables ({{$guid}}, {{$timestamp}} ...) — generated per use, and a
+// line-for-line mirror of backend/src/dynamic-vars.ts. Generating them HERE, in
+// the iteration, is the whole point: the seed map is built once before the run,
+// so a baked value would give every virtual user the same id and the same "now".
+function heraHex(n) {
+  var out = '';
+  for (var i = 0; i < n; i++) { out += Math.floor(Math.random() * 16).toString(16); }
+  return out;
+}
+
+function heraDyn(key) {
+  switch (key) {
+    case '$guid':
+      return heraHex(8) + '-' + heraHex(4) + '-4' + heraHex(3) + '-' +
+        (8 + Math.floor(Math.random() * 4)).toString(16) + heraHex(3) + '-' + heraHex(12);
+    case '$randomInt': return String(Math.floor(Math.random() * 1001));
+    case '$randomHex': return heraHex(16);
+    case '$timestamp': return String(Math.floor(Date.now() / 1000));
+    case '$epochMillis': return String(Date.now());
+    case '$isoTimestamp': return new Date().toISOString();
+    case '$date': return new Date().toISOString().slice(0, 10);
+    default: return undefined;
+  }
+}
+
 // Mirrors VarScope.resolve: up to 5 passes, unknown tokens left literal.
 function heraInterp(text, vars) {
   var out = String(text);
@@ -42,6 +67,8 @@ function heraInterp(text, vars) {
     if (out.indexOf('{{') === -1) { break; }
     var before = out;
     out = out.replace(HERA_TOKEN, function (whole, key) {
+      var d = heraDyn(key);
+      if (d !== undefined) { return d; }
       var v = vars.get(key);
       return v === undefined ? whole : v;
     });
@@ -129,7 +156,11 @@ function heraRunScript(code, res, vars, mode, ctl, stepTag) {
   if (!code || !code.trim()) { return; }
   var response = heraResponse(res);
   var variables = Object.freeze({
-    get: function (key) { return vars.get(String(key)); },
+    get: function (key) {
+      var k = String(key);
+      var d = heraDyn(k);
+      return d !== undefined ? d : vars.get(k);
+    },
     set: function (key, value, scope) {
       if (mode !== 'capture') { throw new Error('variables.set() is only available in capture scripts — use the Capture tab'); }
       var k = String(key);
@@ -252,6 +283,49 @@ function heraCapture(c, res, vars, ctl, stepTag) {
   }
 }
 
+// Per-VU, per-step budget for diagnostic lines. Each VU is its own goja runtime,
+// so this object is per VU: the real ceiling is HERA_DIAG_MAX * vus.
+var HERA_DIAG_LEFT = {};
+
+function heraDiagSafe(s, max) {
+  // One diagnostic must stay ONE log line, so newlines and tabs collapse.
+  // Double quotes become single ones rather than disappearing: the value is
+  // wrapped in "..." so an inner double quote would break the delimiter, but
+  // deleting them turns a JSON error body into unreadable mush.
+  var v = String(s).replace(/[\r\n\t]+/g, ' ').replace(/"/g, "'");
+  if (max > 0 && v.length > max) { v = v.substring(0, max) + '...'; }
+  return v;
+}
+
+// Explains a failed step in one line.
+//
+// Reads the RAW k6 response, not heraResponse(): the wrapper deliberately omits
+// error and error_code, and those are exactly the fields that explain a
+// transport failure (DNS, TLS, timeout) rather than a bad status.
+//
+// The resolved URL is never emitted. heraBuildRequest interpolates {{tokens}}
+// into the URL and query string, so it routinely carries secrets; def.name and
+// def.tag identify the step without that risk.
+function heraDiag(def, res) {
+  if (!HERA_DIAG) { return; }
+  var left = HERA_DIAG_LEFT[def.tag];
+  if (left === undefined) { left = HERA_DIAG_MAX; }
+  if (left <= 0) { HERA_DIAG_LEFT[def.tag] = 0; return; }
+  HERA_DIAG_LEFT[def.tag] = left - 1;
+  var code = res.error_code === undefined || res.error_code === 0 ? '' : String(res.error_code);
+  var dur = res.timings === undefined ? 0 : Math.round(res.timings.duration);
+  var line = 'HERA_DIAG step="' + heraDiagSafe(def.name, 120) + '" tag=' + def.tag +
+    ' status=' + res.status + ' code=' + code + ' dur=' + dur + 'ms';
+  if (res.error !== undefined && res.error !== null && res.error !== '') {
+    line = line + ' err="' + heraDiagSafe(res.error, 200) + '"';
+  }
+  if (HERA_DIAG_BODY) {
+    var body = res.body === null || res.body === undefined ? '' : String(res.body);
+    line = line + ' body="' + heraDiagSafe(body, HERA_DIAG_BODY_MAX) + '"';
+  }
+  console.error(line);
+}
+
 function heraBuildRequest(def, vars) {
   var url = heraInterp(def.url, vars);
   var qs = [];
@@ -333,6 +407,9 @@ function heraRunStep(def, vars) {
 
   for (var i = 0; i < def.assertions.length; i++) { heraAssert(def.assertions[i], res, ctl, def.tag); }
   heraRunScript(def.validateScript, res, vars, 'validate', ctl, def.tag);
+  // After assertions and the validate script, so ctl.failed is final, and on the
+  // last response so a polling step reports what it actually ended on.
+  if (ctl.failed || res.status < 200 || res.status >= 300) { heraDiag(def, res); }
   if (!ctl.failed || HERA_RUN_CAPTURES_ON_FAILURE) {
     for (var c = 0; c < def.captures.length; c++) { heraCapture(def.captures[c], res, vars, ctl, def.tag); }
     heraRunScript(def.captureScript, res, vars, 'capture', ctl, def.tag);

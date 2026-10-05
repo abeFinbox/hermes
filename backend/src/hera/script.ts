@@ -1,4 +1,5 @@
 import { HERA_PRELUDE } from './prelude.js';
+import { deriveProfile, isHeraMode, type HeraMode } from './profile.js';
 import type { Step, Suite } from '../types.js';
 
 /**
@@ -20,6 +21,14 @@ export interface HeraLoadConfig {
   vus: number;
   durationSec: number;
   rps: number;
+  /**
+   * Shape of the run. Absent means 'constant', which is what every run was
+   * before profiles existed — so an old stored config still generates the same
+   * script.
+   */
+  mode?: HeraMode;
+  /** Target arrival rate for 'rate' mode; absent means the server ceiling. */
+  ratePerSec?: number | null;
   thinkTimeMs: number;
   /** null disables the threshold. */
   p95Ms: number | null;
@@ -46,13 +55,25 @@ export interface GenerateInput {
   /** Optional Host header override per step url host, from resolve-then-pin. */
   hostHeader?: string;
   /**
-   * Per-step resolve-then-pin. The url has its ORIGIN replaced by the literal
-   * resolved IP (path and query keep their {{tokens}}), and hostHeader carries
-   * the original hostname — so k6 never performs its own lookup and cannot be
-   * rebound between validation and execution. Keyed by step id, because one
-   * suite can span several origins.
+   * Resolve-then-pin, via k6's own DNS override (`options.hosts`).
+   *
+   * Keys are the hostname (`host` or `host:port`) exactly as it appears in the
+   * request, values are the resolved IP validated in the parent. k6 consults
+   * this map BEFORE any DNS lookup, so the run cannot be rebound to a different
+   * address between validation and execution — but the hostname stays in the
+   * URL, so SNI and TLS certificate validation still work (rewriting the URL to
+   * the literal IP breaks HTTPS: the cert has no IP SANs).
    */
-  pins?: Record<string, { url: string; hostHeader: string }>;
+  hosts?: Record<string, string>;
+  /**
+   * Failure-diagnostic settings, from server config rather than the suite.
+   *
+   * Deliberately here and not in HeraLoadConfig: the load config is persisted as
+   * applied_config_json and echoed into the launch audit row, and an operator
+   * knob does not belong in either. Omit to keep diagnostics off, which is what
+   * the parity harness does for the pre-existing fixture cases.
+   */
+  diag?: { enabled: boolean; max: number; body: boolean; bodyMax: number };
 }
 
 export interface GenerateResult {
@@ -124,14 +145,13 @@ export function stepMetas(suite: Suite): HeraStepMeta[] {
 }
 
 function emitStepDef(step: Step, meta: HeraStepMeta, input: GenerateInput): string {
-  const pin = input.pins?.[step.id];
   const L: string[] = [];
   L.push('  {');
   L.push('    stepId: ' + jsLiteral(meta.stepId) + ',');
   L.push('    tag: ' + jsLiteral(meta.tag) + ',');
   L.push('    name: ' + jsLiteral(meta.name) + ',');
   L.push('    method: ' + jsLiteral(meta.method) + ',');
-  L.push('    url: ' + jsLiteral(pin ? pin.url : step.request.url) + ',');
+  L.push('    url: ' + jsLiteral(step.request.url) + ',');
 
   const headers = step.request.headers.filter((h) => h.enabled && h.key);
   L.push(
@@ -244,7 +264,7 @@ function emitStepDef(step: Step, meta: HeraStepMeta, input: GenerateInput): stri
     L.push('    polling: null,');
   }
 
-  const hostHeader = pin ? pin.hostHeader : input.hostHeader;
+  const hostHeader = input.hostHeader;
   if (hostHeader) {
     L.push('    hostHeader: ' + jsLiteral(hostHeader) + ',');
   } else {
@@ -282,6 +302,10 @@ export function generateScript(input: GenerateInput): GenerateResult {
   L.push('var HERA_STOP_ON_FAILURE = ' + boolLiteral(suite.settings.stopOnFailure) + ';');
   L.push('var HERA_RUN_CAPTURES_ON_FAILURE = ' + boolLiteral(suite.settings.runCapturesOnFailure) + ';');
   L.push('var HERA_THINK_TIME_MS = ' + intLiteral(load.thinkTimeMs) + ';');
+  L.push('var HERA_DIAG = ' + boolLiteral(input.diag ? input.diag.enabled : false) + ';');
+  L.push('var HERA_DIAG_MAX = ' + intLiteral(input.diag ? input.diag.max : 0) + ';');
+  L.push('var HERA_DIAG_BODY = ' + boolLiteral(input.diag ? input.diag.body : false) + ';');
+  L.push('var HERA_DIAG_BODY_MAX = ' + intLiteral(input.diag ? input.diag.bodyMax : 0) + ';');
   L.push('');
 
   // Files opened at init scope — k6 requires open() there. The bytes already
@@ -342,11 +366,45 @@ export function generateScript(input: GenerateInput): GenerateResult {
     thresholds.push("  'http_req_failed': ['rate<" + percentLiteral(load.errorRatePct) + "'],");
   }
 
+  // The profile decides HOW the run is scheduled. Exactly one of scenarios,
+  // stages or vus+duration is emitted: k6 accepts more than one and then silently
+  // prefers a different combination than the reader expects.
+  const profile = deriveProfile(isHeraMode(load.mode) ? load.mode : 'constant', load.vus, load.durationSec, load.rps, load.ratePerSec);
+
   L.push('export var options = {');
-  L.push('  vus: ' + intLiteral(load.vus) + ',');
-  L.push("  duration: '" + intLiteral(load.durationSec) + "s',");
+  if (profile.ratePerSec !== null) {
+    L.push('  scenarios: {');
+    L.push('    hera: {');
+    // Arrival-rate, not VU-driven: throughput stays fixed while the target slows
+    // down, which is the only way to see a queue actually build.
+    L.push("      executor: 'constant-arrival-rate',");
+    L.push('      rate: ' + intLiteral(profile.ratePerSec) + ',');
+    L.push("      timeUnit: '1s',");
+    L.push("      duration: '" + intLiteral(profile.durationSec) + "s',");
+    L.push('      preAllocatedVUs: ' + intLiteral(profile.vus) + ',');
+    L.push('      maxVUs: ' + intLiteral(profile.vus) + ',');
+    L.push('    },');
+    L.push('  },');
+  } else if (profile.stages.length > 0) {
+    L.push('  stages: [');
+    for (const s of profile.stages) {
+      L.push("    { duration: '" + intLiteral(s.durationSec) + "s', target: " + intLiteral(s.target) + ' },');
+    }
+    L.push('  ],');
+  } else {
+    L.push('  vus: ' + intLiteral(profile.vus) + ',');
+    L.push("  duration: '" + intLiteral(profile.durationSec) + "s',");
+  }
   L.push('  rps: ' + intLiteral(load.rps) + ',');
   L.push('  maxRedirects: 0,');
+  // Resolve-then-pin as a k6 DNS override: each hostname is forced to the IP we
+  // validated, but the hostname stays in the request so TLS/SNI still work.
+  const hostKeys = Object.keys(input.hosts ?? {}).sort();
+  if (hostKeys.length > 0) {
+    L.push('  hosts: {');
+    for (const h of hostKeys) L.push('    ' + jsLiteral(h) + ': ' + jsLiteral(input.hosts![h]) + ',');
+    L.push('  },');
+  }
   L.push("  summaryTrendStats: ['min', 'avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],");
   L.push('  thresholds: {');
   L.push(thresholds.join('\n'));

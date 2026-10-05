@@ -23,7 +23,12 @@ type fixtureCase struct {
 	FilePaths  map[string]string        `json:"filePaths"`
 	FileMeta   map[string]hera.FileMeta `json:"fileMeta"`
 	HostHeader string                   `json:"hostHeader"`
-	Suite      struct {
+	// Hosts is hostname -> IP for the options.hosts DNS pin.
+	Hosts map[string]string `json:"hosts"`
+	// Diag carries the failure-diagnostic knobs; omitted means off, as on a
+	// default instance.
+	Diag  *hera.DiagConfig `json:"diag"`
+	Suite struct {
 		Name      string                `json:"name"`
 		Settings  *model.SuiteSettings  `json:"settings"`
 		Variables []model.SuiteVariable `json:"variables"`
@@ -147,6 +152,8 @@ func main() {
 			FilePaths:  filePaths,
 			FileMetas:  fileMetas,
 			HostHeader: c.HostHeader,
+			Hosts:      c.Hosts,
+			Diag:       c.Diag,
 		})
 		chunks = append(chunks, "===== CASE "+c.Name+" =====\n"+script)
 	}

@@ -6,8 +6,9 @@ import { useToast, Confirm, Modal } from '../ui';
 import { useAuth } from '../App';
 import { permsFor } from '../perms';
 import { parseCurl } from '../curl';
-import { emptyStep, type GlobalVariable, type Step, type StepRequest, type StepResult, type Suite } from '../types';
-import { RequestTab, ValidateTab, CaptureTab, PollTab } from '../components/StepTabs';
+import { emptyStep, type Environment, type GlobalVariable, type Step, type StepRequest, type StepResult, type Suite } from '../types';
+import { RequestTab, RequestUrlRow, ValidateTab, CaptureTab, PollTab } from '../components/StepTabs';
+import ScriptBench from '../components/ScriptBench';
 import PollAttempts from '../components/PollAttempts';
 import BodyViewer from '../components/BodyViewer';
 import CurlBlock from '../components/CurlBlock';
@@ -29,6 +30,10 @@ export default function SuiteEditor() {
 
   const [suite, setSuite] = useState<Suite | null>(null);
   const [globals, setGlobals] = useState<GlobalVariable[]>([]);
+  const [envs, setEnvs] = useState<Environment[]>([]);
+  // Environment for THIS editing session: seeded from the suite's default and
+  // saved back with the suite, so Send / Run / Load test all agree on it.
+  const [envId, setEnvId] = useState<string | null>(null);
   const [selected, setSelected] = useState(0);
   const [stepTab, setStepTab] = useState<StepTab>('request');
   const [suiteTab, setSuiteTab] = useState<SuiteTab>('steps');
@@ -40,9 +45,22 @@ export default function SuiteEditor() {
   const [running, setRunning] = useState(false);
   const [stepResults, setStepResults] = useState<Record<string, StepResult | 'running'>>({});
   const detailRef = useRef<HTMLDivElement>(null);
+  const detailBodyRef = useRef<HTMLDivElement>(null);
+  // Wiring for the ⌘/Ctrl+Enter handler below: what to send, what the bench
+  // would run instead, and whether a dialog is currently up.
+  const sendRef = useRef<(() => void) | null>(null);
+  const benchRunRef = useRef<(() => void) | null>(null);
+  const modalOpenRef = useRef(false);
+  const setBenchRunnable = useCallback((run: (() => void) | null) => {
+    benchRunRef.current = run;
+  }, []);
   const [composerOn, setComposerOn] = useState(loadComposerOn);
   const [composerItems, setComposerItems] = useState<ComposerItem[]>(loadComposerItems);
   const [stepQuery, setStepQuery] = useState('');
+  // Reorder-by-drag: the row being dragged, and the slot the pointer is over
+  // (an insertion index, 0..steps.length, so "after the last step" is expressible).
+  const [dragFrom, setDragFrom] = useState<number | null>(null);
+  const [dropSlot, setDropSlot] = useState<number | null>(null);
 
   const toggleComposer = (on: boolean) => {
     setComposerOn(on);
@@ -64,15 +82,45 @@ export default function SuiteEditor() {
         setSuite(s);
         setCycles(s.settings.defaultCycles || 1);
         setStopOnFailure(s.settings.stopOnFailure);
+        setEnvId(s.defaultEnvId ?? null);
       })
       .catch((e) => toast(e.message, 'error'));
     loadGlobals();
+    api.get<Environment[]>('/api/environments').then(setEnvs).catch(() => {});
   }, [id]);
 
-  // keep the detail panel in view when picking a step far down a long list
+  // keep the detail panel in view when picking a step far down a long list, and
+  // start the new step at its top rather than wherever the last one was scrolled
   useEffect(() => {
     detailRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    if (detailBodyRef.current) detailBodyRef.current.scrollTop = 0;
   }, [selected]);
+
+  /**
+   * ⌘/Ctrl + Enter — send the selected step from anywhere in the editor,
+   * including from inside the URL box or the body textarea.
+   *
+   * Everything it needs is read through refs and the listener is installed once:
+   * the handlers below are defined AFTER the `if (!suite)` early return, so they
+   * cannot be effect dependencies without making the hook order conditional.
+   *
+   * When the script bench is open it claims the shortcut (see ScriptBench's
+   * onRunnableChange) — running the bench you are looking at beats firing a real
+   * request you did not ask for.
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+      if (modalOpenRef.current) return; // a dialog owns the keyboard
+      const bench = benchRunRef.current;
+      const send = sendRef.current;
+      if (!bench && !send) return;
+      e.preventDefault();
+      (bench ?? send)!();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   if (!suite) return <div className="muted">Loading…</div>;
 
@@ -103,6 +151,25 @@ export default function SuiteEditor() {
     [steps[i], steps[j]] = [steps[j], steps[i]];
     patchSuite({ steps });
     setSelected(j);
+  };
+
+  /**
+   * Drop a step into a new position. `slot` is an INSERTION index in the current
+   * array (0..length), which is what makes "drop after the last step" sayable.
+   *
+   * Selection is re-derived from the step's id rather than arithmetic on the old
+   * index: after a move the selected step must stay selected wherever it landed,
+   * and every off-by-one here would silently select a neighbour.
+   */
+  const moveStepTo = (from: number, slot: number) => {
+    if (from === slot || from + 1 === slot) return; // already there
+    const selectedId = suite.steps[selected]?.id;
+    const steps = [...suite.steps];
+    const [moved] = steps.splice(from, 1);
+    steps.splice(from < slot ? slot - 1 : slot, 0, moved);
+    patchSuite({ steps });
+    const nextSelected = steps.findIndex((st) => st.id === selectedId);
+    if (nextSelected >= 0) setSelected(nextSelected);
   };
 
   const addStep = () => {
@@ -146,6 +213,7 @@ export default function SuiteEditor() {
         steps: suite.steps,
         variables: suite.variables,
         settings: suite.settings,
+        defaultEnvId: envId,
       });
       setSuite(saved);
       setDirty(false);
@@ -157,17 +225,17 @@ export default function SuiteEditor() {
     }
   };
 
-  /** Hand off to Hera with this suite preselected. Saves first, like run(). */
+  /** Hand off to Hera with this suite (and environment) preselected. Saves first, like run(). */
   const loadTest = async () => {
     if (dirty) await save();
-    navigate(`/hera?suiteId=${id}`);
+    navigate(`/hera?suiteId=${id}${envId ? `&envId=${envId}` : ''}`);
   };
 
   const run = async () => {
     setRunning(true);
     try {
       if (dirty && !(await save())) return;
-      const r = await api.post<{ id: string }>('/api/runs', { suiteId: suite.id, cycles, stopOnFailure });
+      const r = await api.post<{ id: string }>('/api/runs', { suiteId: suite.id, cycles, stopOnFailure, envId });
       navigate(`/runs/${r.id}`);
     } catch (e: any) {
       toast(e.message, 'error');
@@ -186,6 +254,7 @@ export default function SuiteEditor() {
         step: st,
         suiteVariables: suite.variables,
         settings: suite.settings,
+        envId,
       });
       setStepResults((r) => ({ ...r, [st.id]: result }));
       // fold suite-scope captures back into the working variables so the next
@@ -212,6 +281,15 @@ export default function SuiteEditor() {
   };
 
   const step = suite.steps[selected];
+  // Drag-to-reorder needs edit rights and an unfiltered list (see the note in
+  // the step list below).
+  const canReorder = perms.canCreate && stepQuery.trim() === '';
+
+  // Refreshed on every render, so the one-time keydown listener always acts on
+  // the step that is actually selected now.
+  const sendable = !!step && stepResults[step.id] !== 'running' && !!step.request.url.trim();
+  sendRef.current = sendable ? () => void runStep(selected) : null;
+  modalOpenRef.current = importCurl || deletingStep !== null;
 
   return (
     <div>
@@ -245,6 +323,23 @@ export default function SuiteEditor() {
           <input type="checkbox" checked={stopOnFailure} onChange={(e) => setStopOnFailure(e.target.checked)} />
           stop on failure
           <Info k="suite.stopOnFailure" />
+        </label>
+        {/* Environment picker: applies to Run, single-step Send and the Hera
+            hand-off, and is saved as this suite's default. */}
+        <label className="row" style={{ gap: 6 }} title="Named variable set used for this run — overrides globals and suite variables; only runtime captures win over it">
+          environment
+          <select
+            value={envId ?? ''}
+            onChange={(e) => {
+              setEnvId(e.target.value || null);
+              setDirty(true);
+            }}
+          >
+            <option value="">(none)</option>
+            {envs.map((e) => (
+              <option key={e.id} value={e.id}>{e.name}</option>
+            ))}
+          </select>
         </label>
         <div className="grow" />
         {dirty && <span className="muted">unsaved changes will be saved first</span>}
@@ -280,7 +375,10 @@ export default function SuiteEditor() {
             onChange={(items) => patchSuite({ variables: items.map((i) => ({ key: i.key, value: i.value, secret: !i.enabled })) })}
             keyPlaceholder="variableName"
           />
-          <p className="muted">Checkbox = value visible (unchecked marks it secret). Suite variables override globals with the same name.</p>
+          <p className="muted">
+            Checkbox = value visible (unchecked marks it secret). These are the <b>fallback</b> layer: a global or the selected
+            environment with the same name wins over them, and captures made during a run win over everything.
+          </p>
         </div>
       )}
 
@@ -313,7 +411,21 @@ export default function SuiteEditor() {
       {suiteTab === 'steps' && (
         <div className="editor">
           {/* step list */}
-          <div className="step-list">
+          <div className="step-list"
+            /* Column-level fallback: rows are 6px apart, and without this a drop
+               that lands in one of those gaps would cancel the drag even though
+               the insertion line was showing. The last indicated slot is used,
+               so what you saw is what you get. */
+            onDragOver={(e) => { if (dragFrom !== null && dropSlot !== null) e.preventDefault(); }}
+            onDrop={(e) => {
+              if (dragFrom === null || dropSlot === null) return;
+              e.preventDefault();
+              const from = dragFrom;
+              const slot = dropSlot;
+              setDragFrom(null);
+              setDropSlot(null);
+              moveStepTo(from, slot);
+            }}>
             <div className="step-search">
               <input type="text" placeholder="🔍 Search steps by name, method, URL…" value={stepQuery}
                 onChange={(e) => setStepQuery(e.target.value)} />
@@ -328,36 +440,106 @@ export default function SuiteEditor() {
               if (q && visible === 0) return <p className="muted" style={{ fontSize: 12 }}>No steps match “{stepQuery}”.</p>;
               return null;
             })()}
+            {/* Reordering is off while the list is filtered: the rows you see are
+                a subset, so "drop below this one" would land the step next to a
+                neighbour that isn't actually adjacent. ↑/↓ still work. */}
+            {perms.canCreate && stepQuery.trim() !== '' && (
+              <p className="muted" style={{ fontSize: 11 }}>Clear the filter to drag steps into a new order.</p>
+            )}
             {suite.steps.map((st, i) => {
               const q = stepQuery.trim().toLowerCase();
               const matches = !q || [st.name, st.request.method, st.request.url, st.folderPath].some((v) => (v || '').toLowerCase().includes(q));
               if (!matches) return null;
+              const dropClass = dropSlot === i ? 'drop-above' : dropSlot === i + 1 ? 'drop-below' : '';
               return (
-              <div key={st.id} className={`step-item ${i === selected ? 'selected' : ''} ${st.enabled ? '' : 'disabled'} ${composerOn ? 'draggable' : ''}`}
+              <div key={st.id}
+                className={[
+                  'step-item',
+                  i === selected ? 'selected' : '',
+                  st.enabled ? '' : 'disabled',
+                  canReorder || composerOn ? 'draggable' : '',
+                  dragFrom === i ? 'drag-src' : '',
+                  dropClass,
+                ].filter(Boolean).join(' ')}
                 onClick={() => setSelected(i)}
-                draggable={composerOn}
-                onDragStart={(e) => e.dataTransfer.setData('text/step-index', String(i))}>
+                draggable={canReorder || composerOn}
+                onDragStart={(e) => {
+                  // Two payloads, one drag: the composer basket reads
+                  // 'text/step-index', the list below reads 'text/step-reorder'.
+                  // Keeping them separate is what lets both drops coexist.
+                  e.dataTransfer.setData('text/step-index', String(i));
+                  if (canReorder) {
+                    e.dataTransfer.setData('text/step-reorder', String(i));
+                    e.dataTransfer.effectAllowed = 'move';
+                    setDragFrom(i);
+                  }
+                }}
+                onDragOver={(e) => {
+                  if (!canReorder || dragFrom === null) return;
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'move';
+                  // Top half inserts before this row, bottom half after it.
+                  const box = e.currentTarget.getBoundingClientRect();
+                  setDropSlot(e.clientY < box.top + box.height / 2 ? i : i + 1);
+                }}
+                onDrop={(e) => {
+                  if (!canReorder) return;
+                  const raw = e.dataTransfer.getData('text/step-reorder');
+                  const from = Number(raw);
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const slot = dropSlot;
+                  setDragFrom(null);
+                  setDropSlot(null);
+                  if (raw === '' || Number.isNaN(from) || slot === null) return;
+                  moveStepTo(from, slot);
+                }}
+                onDragEnd={() => { setDragFrom(null); setDropSlot(null); }}>
+                {(canReorder || composerOn) && (
+                  <span className="step-grip" title={canReorder ? 'Drag to reorder' : 'Drag onto the composer basket'}>⠿</span>
+                )}
                 <input type="checkbox" checked={st.enabled} title="Enable/disable this step (disabled steps are skipped)"
                   onClick={(e) => e.stopPropagation()} onChange={(e) => patchStep(i, { enabled: e.target.checked })} />
                 <span className={`chip ${st.request.method}`}>{st.request.method}</span>
-                <span className="name">
+                {/* The name is the thing you actually read down this list, so it
+                    gets the full width at rest — the actions below only take
+                    space once the row is hovered, focused or selected. */}
+                <span className="name" title={st.name || '(unnamed)'}>
                   {st.name || <span className="muted">(unnamed)</span>}
                   {st.folderPath && <span className="folder">{st.folderPath}</span>}
                 </span>
-                {composerOn && (
-                  <button className="btn icon" title="Add this request to the composer basket"
-                    onClick={(e) => { e.stopPropagation(); addToComposer(i); }}>＋</button>
-                )}
-                <button className="btn icon" title="Run only this step (uses current edits, nothing is saved)"
-                  disabled={stepResults[st.id] === 'running'}
-                  onClick={(e) => { e.stopPropagation(); void runStep(i); }}>▶</button>
-                {perms.canCreate && <button className="btn icon" title="Move up" onClick={(e) => { e.stopPropagation(); moveStep(i, -1); }}>↑</button>}
-                {perms.canCreate && <button className="btn icon" title="Move down" onClick={(e) => { e.stopPropagation(); moveStep(i, 1); }}>↓</button>}
-                {perms.canCreate && <button className="btn icon" title="Duplicate step" onClick={(e) => { e.stopPropagation(); duplicateStep(i); }}>⧉</button>}
-                {perms.canDelete && <button className="btn icon danger" title="Delete step" onClick={(e) => { e.stopPropagation(); setDeletingStep(i); }}>✕</button>}
+                <span className="step-actions">
+                  {composerOn && (
+                    <button className="btn icon" title="Add this request to the composer basket"
+                      onClick={(e) => { e.stopPropagation(); addToComposer(i); }}>＋</button>
+                  )}
+                  <button className="btn icon" title="Run only this step (uses current edits, nothing is saved)"
+                    disabled={stepResults[st.id] === 'running'}
+                    onClick={(e) => { e.stopPropagation(); void runStep(i); }}>▶</button>
+                  {perms.canCreate && <button className="btn icon" title="Move up" onClick={(e) => { e.stopPropagation(); moveStep(i, -1); }}>↑</button>}
+                  {perms.canCreate && <button className="btn icon" title="Move down" onClick={(e) => { e.stopPropagation(); moveStep(i, 1); }}>↓</button>}
+                  {perms.canCreate && <button className="btn icon" title="Duplicate step" onClick={(e) => { e.stopPropagation(); duplicateStep(i); }}>⧉</button>}
+                  {perms.canDelete && <button className="btn icon danger" title="Delete step" onClick={(e) => { e.stopPropagation(); setDeletingStep(i); }}>✕</button>}
+                </span>
               </div>
               );
             })}
+            {/* Explicit tail target: without it there is no row whose bottom half
+                means "last", so a step could never be dragged to the end. */}
+            {canReorder && dragFrom !== null && (
+              <div className={`step-drop-tail ${dropSlot === suite.steps.length ? 'active' : ''}`}
+                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; setDropSlot(suite.steps.length); }}
+                onDrop={(e) => {
+                  const raw = e.dataTransfer.getData('text/step-reorder');
+                  const from = Number(raw);
+                  e.preventDefault();
+                  setDragFrom(null);
+                  setDropSlot(null);
+                  if (raw !== '' && !Number.isNaN(from)) moveStepTo(from, suite.steps.length);
+                }}>
+                drop here to move to the end
+              </div>
+            )}
             {perms.canCreate && (
               <div className="row" style={{ gap: 6 }}>
                 <button className="btn grow" onClick={addStep}>+ Add step</button>
@@ -383,6 +565,7 @@ export default function SuiteEditor() {
                     <Info k="step.enabled" />
                   </label>
                   <button className="btn primary" style={{ flexShrink: 0 }}
+                    title="Send this request — ⌘/Ctrl + Enter"
                     disabled={stepResults[step.id] === 'running' || !step.request.url.trim()}
                     onClick={() => void runStep(selected)}>
                     {stepResults[step.id] === 'running' ? 'Sending…' : '▶ Send'}
@@ -408,6 +591,17 @@ export default function SuiteEditor() {
                   </button>
                 </div>
 
+                {/* Pinned above the scroll: method, URL and the placeholder chips.
+                    Kept out of the scrolling body on purpose — the URL is what you
+                    check while editing params, a body or an assertion. */}
+                <fieldset className="editor-fieldset step-detail-url" disabled={!perms.canCreate}>
+                  <RequestUrlRow step={step} stepIndex={selected} steps={suite.steps} suiteVars={suite.variables}
+                    globals={globals} onChange={(p) => patchStep(selected, p)} onGlobalsChanged={loadGlobals} />
+                </fieldset>
+
+                {/* Everything from here down scrolls inside the panel, so the wheel
+                    works with the cursor over the step instead of only outside it. */}
+                <div className="step-detail-body" ref={detailBodyRef}>
                 {/* fieldset disabled makes every editing control inside read-only for
                     roles without canCreate (npc); Send/Run above stay usable */}
                 <fieldset className="editor-fieldset" disabled={!perms.canCreate}>
@@ -429,6 +623,19 @@ export default function SuiteEditor() {
                   )}
                 </fieldset>
 
+                {/* Outside the fieldset on purpose: the bench sends no request and
+                    saves nothing, so read-only roles may use it like Send. */}
+                {stepTab !== 'request' && (
+                  <ScriptBench
+                    mode={stepTab}
+                    step={step}
+                    suiteVars={suite.variables}
+                    envId={envId}
+                    lastResult={stepResults[step.id]}
+                    onRunnableChange={setBenchRunnable}
+                  />
+                )}
+
                 {stepResults[step.id] && stepResults[step.id] !== 'running' && (
                   <StepRunResult result={stepResults[step.id] as StepResult}
                     onDismiss={() => setStepResults((r) => {
@@ -437,6 +644,7 @@ export default function SuiteEditor() {
                       return next;
                     })} />
                 )}
+                </div>
               </>
             ) : (
               <div className="muted">This suite has no steps yet — click “+ Add step”.</div>

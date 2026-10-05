@@ -17,10 +17,16 @@ services:
       # Hera (k6 load testing). Both backends must agree: they share the
       # database, and therefore the single-run lock.
       HERA_ENABLED: "1"
-      # HERA_TARGET_ALLOW: ""        # empty = this instance's own /mock ONLY
+      HERA_TARGET_ALLOW: "*.finbox.in"        # empty = this instance's own /mock ONLY
       # HERA_MAX_VUS: "20"           # ceiling 100
       # HERA_MAX_DURATION_SEC: "60"  # ceiling 300
       # HERA_ALLOW_MODERATOR: "0"    # 1 lets moderators launch, not just admins
+      # Live log panel + per-step failure diagnostics.
+      # HERA_LOG_LINES: "2000"       # lines kept in memory per run (100-20000)
+      # HERA_DIAG: "1"               # one line per failed step: status + k6 error code
+      # HERA_DIAG_MAX: "3"           # PER VU, so the real ceiling is this x vus
+      # HERA_DIAG_BODY: "1"          # 0 stops storing response snippets AT REST
+      # HERA_DIAG_BODY_MAX: "512"    # truncation for that snippet (ceiling 2048)
     volumes:
       - hermes-data:/data
     restart: unless-stopped
@@ -41,6 +47,14 @@ services:
       ADMIN_PASSWORD: "change-me"
       DATA_DIR: "/data"
       HERA_ENABLED: "1" # keep in step with the node service above
+      HERA_TARGET_ALLOW: "*.finbox.in"        # empty = this instance's own /mock ONLY
+      # Uncomment in step with the node service — HERA_DIAG_BODY especially, or
+      # one engine stores response bodies and the other does not.
+      # HERA_LOG_LINES: "2000"
+      # HERA_DIAG: "1"
+      # HERA_DIAG_MAX: "3"
+      # HERA_DIAG_BODY: "1"
+      # HERA_DIAG_BODY_MAX: "512"
     volumes:
       - hermes-data:/data # same volume as node → shared app.db + jwt-secret
     restart: unless-stopped

@@ -161,6 +161,17 @@ spec:
 #   2. env: HERA_ENABLED=1, HERA_MAX_VUS=50, and HERA_TARGET_ALLOW set to the
 #      hosts you actually intend to load-test. Leaving HERA_TARGET_ALLOW unset
 #      keeps Hera pointed at this instance's own /mock API and nothing else.
+#      Optional, and identical on every replica of BOTH engines:
+#        HERA_LOG_LINES=2000     live log lines held per run (memory only)
+#        HERA_DIAG=1             one line per failed step: HTTP status + k6 code
+#        HERA_DIAG_MAX=3         PER VU, so the real ceiling is this x vus
+#        HERA_DIAG_BODY=1        stores a response-body snippet in the run row,
+#                                i.e. response payloads at rest on the PVC. Set 0
+#                                for any instance pointed at production data.
+#        HERA_DIAG_BODY_MAX=512
+#      NOTE the live log route answers from the process that spawned k6. Scaled
+#      past one replica per engine, a poll can land on a pod that does not own the
+#      run; it then returns source=none with a reason rather than an empty log.
 #   3. Add the NetworkPolicy below. The app-level allow-list is a usability
 #      guard; egress policy is the actual blast-radius control, because an
 #      app-level check is one bug away from failing open.

@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState } from 'react';
-import { Navigate, NavLink, Route, Routes, useNavigate } from 'react-router-dom';
+import { Navigate, NavLink, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import { api } from './api';
 import type { User } from './types';
 import { Info, useLegends } from './legends';
@@ -19,6 +19,7 @@ import Settings from './pages/Settings';
 import Docs from './pages/Docs';
 import TopbarMetrics from './components/TopbarMetrics';
 import EngineIndicator from './components/EngineIndicator';
+import RouteFX from './components/RouteFX';
 import { permsFor, ROLE_LABELS } from './perms';
 
 interface AuthCtx {
@@ -31,6 +32,7 @@ export const useAuth = () => useContext(Ctx);
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [checking, setChecking] = useState(true);
+  const location = useLocation();
 
   useEffect(() => {
     api.get<User>('/api/auth/me')
@@ -76,7 +78,6 @@ function Shell() {
           <NavLink to="/variables">Variables<Info k="nav.variables" /></NavLink>
           <NavLink to="/files">Files<Info k="nav.files" /></NavLink>
           <NavLink to="/runs">Runs<Info k="nav.runs" /></NavLink>
-          {perms.canLoadTest && <NavLink to="/hera">Hera<Info k="nav.hera" /></NavLink>}
           {perms.canAppearance && <NavLink to="/appearance">Appearance<Info k="nav.appearance" /></NavLink>}
           <NavLink to="/settings">Settings<Info k="nav.settings" /></NavLink>
           {perms.canViewDocs && <NavLink to="/docs">Docs<Info k="nav.docs" /></NavLink>}
@@ -104,7 +105,9 @@ function Shell() {
           </label>
         </div>
         <div className="content">
-          <Routes>
+          <RouteFX />
+          <div className="route-page" key={location.pathname}>
+          <Routes location={location}>
             <Route path="/" element={<Navigate to="/suites" replace />} />
             <Route path="/collections" element={<Collections />} />
             <Route path="/suites" element={<Suites />} />
@@ -120,6 +123,7 @@ function Shell() {
             <Route path="/docs" element={perms.canViewDocs ? <Docs /> : <Navigate to="/suites" replace />} />
             <Route path="*" element={<Navigate to="/suites" replace />} />
           </Routes>
+          </div>
         </div>
       </div>
     </div>

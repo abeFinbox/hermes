@@ -3,6 +3,7 @@ package hera
 import (
 	"context"
 	"fmt"
+	"github.com/finbox/hermes/backend-go/internal/dynvars"
 	"net"
 	"net/url"
 	"regexp"
@@ -56,7 +57,14 @@ type TargetOptions struct {
 
 var tokenRe = regexp.MustCompile(`\{\{\s*([^}\s]+)\s*\}\}`)
 
-// Interpolate mirrors VarScope.Resolve: up to 5 passes, unknown tokens literal.
+/*
+Interpolate mirrors VarScope.Resolve: up to 5 passes, unknown tokens literal.
+
+Dynamic variables ({{$guid}} etc.) are left literal too, on purpose: this feeds
+the preflight PREVIEW, and a URL reading .../items?id={{$guid}} is more honest
+than one showing a UUID that will not be the one sent. Preflight already reports
+such tokens as runtime tokens. Host validation uses InterpolateForTarget.
+*/
 func Interpolate(text string, vars map[string]string) string {
 	out := text
 	for pass := 0; pass < 5; pass++ {
@@ -68,6 +76,42 @@ func Interpolate(text string, vars map[string]string) string {
 			m := tokenRe.FindStringSubmatch(whole)
 			if m == nil {
 				return whole
+			}
+			if v, ok := vars[m[1]]; ok {
+				return v
+			}
+			return whole
+		})
+		if out == before {
+			break
+		}
+	}
+	return out
+}
+
+/*
+InterpolateForTarget is the interpolation used to decide WHERE a request goes.
+
+Same as Interpolate, except dynamic variables collapse to a fixed placeholder
+(dynvars.Placeholder). Two reasons: a host must be validated and pinned to one IP
+before the run starts, which is impossible if part of it is random; and the
+target parity harness compares both engines byte for byte, so a live UUID here
+would make every comparison fail.
+*/
+func InterpolateForTarget(text string, vars map[string]string) string {
+	out := text
+	for pass := 0; pass < 5; pass++ {
+		if !strings.Contains(out, "{{") {
+			break
+		}
+		before := out
+		out = tokenRe.ReplaceAllStringFunc(out, func(whole string) string {
+			m := tokenRe.FindStringSubmatch(whole)
+			if m == nil {
+				return whole
+			}
+			if p, ok := dynvars.Placeholder(m[1]); ok {
+				return p
 			}
 			if v, ok := vars[m[1]]; ok {
 				return v
@@ -157,7 +201,7 @@ func matchesAllow(entry, host, port string, ips []string) bool {
 
 // ValidateTarget resolves variables in the URL, then validates the origin.
 func ValidateTarget(rawURL string, vars map[string]string, opts TargetOptions) ResolvedTarget {
-	return validate(Interpolate(rawURL, vars), opts)
+	return validate(InterpolateForTarget(rawURL, vars), opts)
 }
 
 const templatedOrigin = "The target host still contains {{...}} after variable resolution, so it cannot be checked against the allow-list. Define the variable, or hard-code the host."

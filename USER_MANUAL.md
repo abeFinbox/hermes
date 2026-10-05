@@ -73,13 +73,39 @@ Layout: suite header (name, description, **Save**, 🧺 Composer toggle) → **r
 
 Steps execute **top to bottom** — order matters because captures from earlier steps feed later ones.
 
-Per-row controls: **checkbox** enable/disable (disabled steps are skipped but kept) · **＋** add to composer (only when composer is on) · **▶** run only this step · **↑/↓** reorder · **⧉** duplicate · **✕** delete. For long suites the list scrolls inside its own column, so the detail panel stays visible.
+Always on the row: the **⠿** drag handle, the **checkbox** that enables/disables the step (disabled steps are skipped but kept), the method chip, and the step **name** — which gets the whole width, because that is what you scan the list for.
+
+The action icons — **＋** add to composer (composer on only) · **▶** run just this step · **↑/↓** reorder · **⧉** duplicate · **✕** delete — appear when the row is hovered, focused or selected, floating over its right-hand edge so they never shorten the name. On a touch screen (no hover) they stay visible and get bigger hit areas. Tab still reaches them, and the full name is in the row's tooltip.
+
+For long suites the list scrolls inside its own column, so the detail panel stays visible.
+
+**Reordering by drag**: grab a row anywhere (or by its ⠿ handle) and drop it where you want it. A line marks the insertion point — top half of a row means *before* it, bottom half *after* it — and a drop zone appears under the list for "move to the end". The step you had selected stays selected wherever it lands, and like every other edit the new order is not saved until you hit **Save**.
+
+Dragging is disabled while the step filter is active: the rows you see are a subset, so "drop below this one" would put the step next to a neighbour that isn't actually adjacent. Clear the filter, or use **↑/↓**, which always work. With the composer on, dragging a row onto the basket still adds it there — the two drops don't collide.
 
 ### The step detail — three tabs
 
 - **Request** — method, URL, query params, headers, body (none / JSON / raw / form-urlencoded / **form-data**), auth (none / bearer / basic). Every text field supports `{{variable}}` placeholders. Below the URL, **chips** show every placeholder the step uses: green = defined, red = undefined (click *define as global* to fix it on the spot). Imported steps have a **↩ Reset to imported original** button.
 - **Validate** — checks that run after the response. See [§7](#7-validating-responses).
 - **Capture** — pulls values out of the response into variables for later steps. See [§6](#6-variables--chaining).
+
+### Beautifying and minifying a payload
+
+In the **Request** tab, JSON and raw bodies get two buttons: **✨ Beautify** re-indents with a 2-space indent, **🗜 Minify** collapses the payload onto one line. They are exact inverses — minifying a beautified payload gives back the original text, character for character.
+
+Both understand templated payloads, which plain JSON formatting cannot: every `{{token}}` is masked before parsing and restored afterwards, so `"id": "{{$guid}}"` keeps its quotes and a bare `"amount": {{amount}}` — not valid JSON on its own — survives untouched. If the body is genuinely malformed, nothing is changed and the parse error is shown as a toast.
+
+### Scrolling a long step
+
+The step panel is its own scroller. The step name, the tab strip, and the **method + URL + placeholder chips** stay pinned at the top; everything from **Query params** downwards scrolls inside the panel — so the wheel works with the cursor over the step, and the URL you are editing against stays on screen. The URL row is visible on the Validate, Capture and Poll tabs too.
+
+Picking another step resets that scroll to the top. Once the panel's own content reaches its end the wheel continues onto the page, and on narrow windows (under 820px, where the columns stack) the panel goes back to growing with the page instead of nesting a short scroller.
+
+### Keyboard: send with ⌘/Ctrl + Enter
+
+**⌘ + Enter** (macOS) or **Ctrl + Enter** (Windows/Linux) sends the selected step, from anywhere in the editor — including while the cursor is in the URL box or the body textarea. It is the same action as **▶ Send**, so it respects the environment picked in the run bar and uses your unsaved edits.
+
+When a script bench panel is open (Validate / Capture / Poll), the same shortcut runs **the bench** instead — you are looking at it, so running it beats firing a real request. Dialogs (cURL import, delete confirmation) keep the keyboard to themselves.
 
 ### Attaching files (form-data body)
 
@@ -94,7 +120,7 @@ Hermes sets the `Content-Type` (with the multipart boundary) automatically — d
 
 ### Suite variables tab
 
-Key/value pairs scoped to this suite. They override globals of the same name. The checkbox column marks a value as visible; unchecked = secret (masked).
+Key/value pairs scoped to this suite — the **fallback** layer, used when neither the selected environment nor a global defines the name (see [§6](#6-variables--chaining)). This is where a Postman import parks its collection variables. The checkbox column marks a value as visible; unchecked = secret (masked).
 
 ### Settings tab
 
@@ -110,10 +136,74 @@ Key/value pairs scoped to this suite. They override globals of the same name. Th
 When `{{name}}` is resolved, the first match wins:
 
 1. **Runtime** — captured earlier in the *current run/cycle*
-2. **Suite** — the suite's Variables tab
-3. **Global** — the Variables page (shared by all suites)
+2. **Environment** — the environment selected for this run (see below)
+3. **Global** — the Variables page, Global tab (shared by all suites)
+4. **Suite** — the suite's Variables tab
 
-So a captured `{{token}}` beats a stale suite value, and a suite's `{{baseUrl}}` beats the global one. Suite variables reset at the start of each cycle; globals persist (and global captures are saved permanently, immediately).
+So a captured `{{token}}` beats everything, the environment's `{{base_url}}` beats the global one, and a global beats the suite's own value.
+
+**This is deliberately not Postman's order**, where collection variables outrank the environment and globals. The reason is what suite variables usually *are* here: values that arrived with a Postman import — a `base_url` pointing at whatever host the collection was recorded against. Under Postman's order those imported values silently shadowed the environment you selected and the globals you had just edited, so switching environment appeared to do nothing. Suite variables are the **fallback** layer: what a suite ships with, used when nothing above it defines the name.
+
+Two consequences worth knowing:
+
+- To override one value for a single suite, put it in that suite's **environment** (or capture it at runtime), not in the suite's Variables tab — the tab is now the bottom of the chain.
+- A capture with scope **global** writes to the globals as asked, but if the selected environment defines the same name, the environment still wins on read. Capture to **suite** or **runtime** scope in that case — both also write the runtime layer, which outranks everything.
+
+Suite variables reset at the start of each cycle; globals persist (and global captures are saved permanently, immediately).
+
+### Environments — reusable variable sets
+
+An **environment** is a named set of variables (`dev`, `staging`, `local`, whatever you call it) that you point a run at. Same suite, same steps, different `{{baseUrl}}` and credentials.
+
+Manage them on the **Variables** page: the tab strip is the scope selector — **Global** plus one tab per environment. Buttons there create, rename, duplicate and delete environments (deleting is admin-only, like every other delete).
+
+Selecting one:
+
+- **Suite editor → run bar → environment**: this is the suite's *default*, saved with the suite. It applies to **▶ Run**, to a single-step **Send**, and is carried over to Hera by **⚡ Load test**.
+- **Hera → New load test → Environment**: pre-filled from the suite's default, overridable for that one test.
+- `(none)` is always available and means globals + suite variables only.
+
+Every run records the environment it used — by id *and* by name, so old runs stay readable after a rename or delete. You can see it on the run detail page ("Environment: dev") and on a load test's detail page. Deleting an environment clears it from any suite that pointed at it; those suites fall back to `(none)` rather than breaking.
+
+Two suites can run against different environments at the same time — the selection is per run, not a single global switch.
+
+### Dynamic tokens — `{{$guid}}`, `{{$timestamp}}` …
+
+Some values should not be stored anywhere, because they must be different on every request. Those are written as `{{$name}}` and generated by the runner at send time:
+
+| Token | Produces | Example |
+|---|---|---|
+| `{{$guid}}` | Random UUID v4 — the usual choice for a link id | `3f2b9c74-5e41-4a8f-b0d2-9c1e77a4e5b3` |
+| `{{$randomInt}}` | Random integer, 0–1000 | `742` |
+| `{{$randomHex}}` | 16 random hex characters | `a3f19c02b7d45e68` |
+| `{{$timestamp}}` | Now, Unix seconds | `1788945353` |
+| `{{$epochMillis}}` | Now, Unix milliseconds | `1788945353514` |
+| `{{$isoTimestamp}}` | Now, ISO 8601 UTC | `2026-09-09T09:15:53.514Z` |
+| `{{$date}}` | Today in UTC | `2026-09-09` |
+
+They work anywhere a variable works — URL, query params, headers, the body, and bearer/basic auth — and in scripts via `variables.get("$guid")`. In the editor they show up as a blue **generated** chip rather than a red undefined one.
+
+```json
+{
+  "link_id": "{{$guid}}",
+  "requested_at": "{{$isoTimestamp}}",
+  "business_date": "{{$date}}",
+  "epoch": {{$timestamp}},
+  "nonce": {{$randomInt}}
+}
+```
+
+**Evaluated per occurrence**, like Postman. Two `{{$guid}}` in one payload are two different UUIDs, and the same token in step 1 and step 5 differs. When one value has to appear in several places — the usual case for a link/session id — generate it once and capture it:
+
+- put `{{$guid}}` in the request that creates the resource, then capture the id the server returns; or
+- capture it directly in a capture script: `variables.set("link_id", variables.get("$guid"))` — from then on `{{link_id}}` is that one id for the rest of the run (a new one next cycle).
+
+Under Hera the tokens are generated **inside each k6 iteration**, so every virtual user sends its own id and its own "now" — verified with 3 VUs over 12 s: the timestamp assertion held on all 60 iterations.
+
+Two details worth knowing:
+
+- Nothing is stored, so nothing can shadow them: a variable name can never start with `$`.
+- In the Hera **Targets** preview a dynamic token stays literal (`.../items?rid={{$guid}}`) and is listed as a runtime token. That is deliberate — the preview would otherwise show a UUID that is not the one sent, and a host has to be pinned to one IP before the run starts.
 
 ### Capturing (the chaining mechanism)
 
@@ -168,6 +258,25 @@ test("fast enough", () => {
 ```
 
 Each `test()` becomes its own pass/fail line in run results and reports. Full API in [§15](#15-script-api-reference).
+
+### Trying a script without sending a request (script bench)
+
+Under the **Validate**, **Capture** and **Poll** tabs there is a **🧪 Try …** button. It opens a small panel where you type a response — status, status text, response time, headers (`Name: value`, one per line) and body — and run this tab's logic against it. No HTTP request is made and nothing is saved.
+
+Why it's there: the alternative is re-sending the real request until an assertion fires, which needs the service up and cannot reproduce the cases you most want to cover — a 500, a truncated body, the third poll attempt. Here the response is just input you control.
+
+What it reports:
+
+- **would PASS / would FAIL** — the same verdict the step would get.
+- **Assertions** — visual rules *and* every `test()`, in the order a run reports them.
+- **Would capture** (Capture tab) — each variable and the value it would receive, with the scope the rule declares. Nothing is written, not even a `global` capture.
+- **Variables read by the script** — every name the script asked for and what it resolved to, using the environment currently selected in the run bar. This is the fast way to catch a `{{token}}` that is silently undefined.
+- **Would stop / would continue** (Poll tab) — whether `stop()` was called, i.e. whether polling would end on an attempt like this.
+- **console.log** output and any script error (syntax error, bad `JSON.parse`, timeout).
+
+**Fill from last response** copies the most recent single-step **Send** result into the fields, which is usually the quickest starting point: send once, then edit the body to the failure case you want to assert on.
+
+Every role can use the bench, including read-only `npc` — it sends nothing and writes nothing.
 
 ## 8. Running: single step, whole suite, cycles
 
@@ -306,7 +415,8 @@ Scripts run **server-side** in a sandbox: 2-second timeout, no filesystem, no ne
 
 | Member | Meaning |
 |---|---|
-| `variables.get(key)` | Resolved value (runtime > suite > global), or `undefined` |
+| `variables.get(key)` | Resolved value (runtime > environment > global > suite), or `undefined` |
+| `variables.get("$guid")` | Any [dynamic token](#dynamic-tokens--guid-timestamp-) — generated on each call, so two calls give two values |
 | `variables.set(key, value)` | Set **suite-scope** — *capture scripts only* |
 | `variables.set(key, value, "global")` | Set + persist a **global** — *capture scripts only* |
 
@@ -382,9 +492,50 @@ finishes is reported **passed** however slow it was — only a k6 failure or a
 broken script fails it. Set a p95 or an error-rate threshold to get a real
 pass/fail.
 
+**Environment** picks the variable set every virtual user resolves against. It is
+pre-filled from the suite's default and can be changed for this test alone;
+`(none)` means globals + suite variables only. Switch it and the **Targets** list
+below re-resolves immediately, so you can see that you are about to load `staging`
+and not production before you start. The run row records the environment (by name
+too), and a step's rebuilt cURL uses the environment that run actually used.
+
 **Targets** shows exactly where the load will go, resolved from your variables.
 Hosts are pinned to a resolved IP before the run starts, so a DNS change
-mid-run cannot redirect your load somewhere else.
+mid-run cannot redirect your load somewhere else. IPv6 targets are handled too —
+including `localhost`, which resolves to `::1` first on macOS.
+
+### Load modes — the shape of the run
+
+**Mode** in the launch form decides how load arrives over time. A mode never adds
+load beyond the virtual users and duration you already set: `VUs` is the peak,
+`Duration` is the total, and the stages always add up to exactly that total. Every
+server cap therefore applies identically in every mode.
+
+| Mode | Shape | Use it to answer |
+|---|---|---|
+| **Constant** | flat, full load for the whole run | "how does it behave at N users" |
+| **Smoke** | 1 virtual user (whatever you typed) | "does this suite even work under k6" |
+| **Load** | ramp up 20%, hold 60%, ramp down 20% | "how does it behave through a normal busy period" |
+| **Stress** | four steps at 25/50/75/100% of your VUs | "at which step does latency turn" |
+| **Spike** | low baseline, sudden surge to full, then recover | "does it survive a burst, and does it recover" |
+| **Soak** | steady, for a long time | "does it drift, leak or degrade over time" |
+| **Rate** | fixed arrival rate, VUs are just budget | "what happens at exactly N iterations/s" |
+
+The form shows the derived shape before you start — `0→20 over 12s, hold 36s,
+20→0 over 12s` — and the run page records which mode ran.
+
+Two things worth knowing:
+
+- **Soak is capped by `HERA_MAX_DURATION_SEC`** (300s by default). A real soak
+  wants tens of minutes, so an operator has to raise that ceiling first.
+- **Rate mode counts ITERATIONS, not requests.** One iteration is one full pass
+  through the suite, so a 7-step suite at 10/s is roughly 70 requests/s. If the
+  target cannot keep up, k6 does not slow down — it reports **dropped
+  iterations**, which appears as its own tile on the run page. That number is the
+  point of the mode: it means the arrival rate exceeded what the system could
+  absorb. A run that drops nothing sustained the rate.
+- If a run is too short for its shape (a spike needs at least 10s), Hera runs it
+  flat and says so in the form rather than emitting one-second ramps.
 
 ### What Hera can point at
 
@@ -419,6 +570,64 @@ VUs and error rate *are* instantaneous.
 **Wait p95** is the number to care about for an async pipeline: it is
 time-to-completion — how long a caller waited for the work to actually finish
 under this load — not per-request latency.
+
+### The k6 output panel, and why a step failed
+
+The **k6 output** panel at the bottom of a run streams k6's own output while the
+run is going, roughly every 2 seconds, and keeps the last 64KB of it afterwards.
+It is open by default while a run is live. Copy, wrap, **Errors only** and
+**Follow** are in its toolbar; Follow keeps the newest line in view and switches
+itself off as soon as you scroll up, so it never yanks you away mid-read.
+
+For any step that ends non-2xx or fails an assertion, Hera adds one line of its
+own:
+
+```
+HERA_DIAG step="Insights" tag=s07 status=401 code=1401 dur=42ms body="{'error':'missing or invalid bearer token'}"
+```
+
+That is the answer to "the step is 100% red and the numbers tell me nothing":
+`status` is the HTTP status and `code` is k6's own error code, which is what
+distinguishes a real 401 from a DNS failure, a TLS rejection or a timeout — cases
+where there is no status at all.
+
+Three things worth knowing:
+
+- **The limit is per virtual user.** `HERA_DIAG_MAX` (default 3) is per step *per
+  VU*, so a 20-VU run can show up to 60 lines for one step. Enough to see a
+  pattern, not enough to bury the log.
+- **The response body is included**, truncated to `HERA_DIAG_BODY_MAX`
+  characters (512 by default) and flattened to one line, with double quotes
+  shown as single ones. It is usually the only thing that actually explains a
+  4xx. Note the trade-off: these lines are stored with the run, so bodies sit at
+  rest in the database until the run is deleted — an operator pointing Hera at
+  production data should set `HERA_DIAG_BODY=0`.
+- **The URL is never printed**, not even truncated, because a resolved URL
+  routinely contains `{{token}}` values. The step name and tag identify it
+  instead.
+
+If a run is live on the *other* engine, the panel says so rather than showing an
+empty log: live output only exists in the process that launched k6. Once the run
+finishes, either engine can show it.
+
+### Reproducing a failing step with cURL
+
+Every row in **Per step** has a **⧉ cURL** button. It gives you the request that
+step actually sent, as a command you can paste into a terminal — same
+construction order as the load test itself, so if the step returned 401 under
+load, the command returns 401 too.
+
+- **Real values, including secrets.** A masked `Authorization` header would
+  reproduce a *different* 401 from the one you are chasing, which is worse than
+  useless. So the command is built on demand, never stored with the run, and only
+  admins (or moderators where `HERA_ALLOW_MODERATOR=1` is set) can see it.
+- **Variables captured mid-run stay as `{{name}}`.** A `{{session_id}}` created
+  by an earlier step cannot exist before the run; the modal lists those and you
+  substitute a real value.
+- **It is built from the suite as it is now.** Hera stores no request snapshot,
+  so if the suite was edited after the run, the modal says so.
+- File uploads become `-F 'field=@filename'` — the file has to be in your working
+  directory for the command to run.
 
 ### How your scripts behave under load
 

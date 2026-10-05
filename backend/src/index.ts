@@ -8,6 +8,7 @@ import { authRouter, usersRouter, requireAuth, enforcePermissions } from './auth
 import { collectionsRouter } from './routes/collections.js';
 import { suitesRouter } from './routes/suites.js';
 import { variablesRouter } from './routes/variables.js';
+import { environmentsRouter } from './routes/environments.js';
 import { runsRouter } from './routes/runs.js';
 import { docsRouter } from './routes/docs.js';
 import { filesRouter } from './routes/files.js';
@@ -41,6 +42,7 @@ protectedApi.use(requireAuth, enforcePermissions);
 protectedApi.use('/collections', collectionsRouter);
 protectedApi.use('/suites', suitesRouter);
 protectedApi.use('/variables', variablesRouter);
+protectedApi.use('/environments', environmentsRouter);
 protectedApi.use('/runs', runsRouter);
 protectedApi.use('/docs', docsRouter);
 protectedApi.use('/files', filesRouter);

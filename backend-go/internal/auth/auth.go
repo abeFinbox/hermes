@@ -205,6 +205,10 @@ func EnforcePermissions(next http.Handler) http.Handler {
 		// /api/runs entries above.
 		isExecute := (p == "/api/runs" && m == http.MethodPost) ||
 			(p == "/api/runs/step" && m == http.MethodPost) ||
+			// Script bench: runs a sandbox script against a response the user
+			// typed in. No HTTP request, no persistence — strictly less powerful
+			// than /api/runs/step, which every role already has.
+			(p == "/api/runs/try-script" && m == http.MethodPost) ||
 			(execRe.MatchString(p) && m == http.MethodPost) ||
 			(heraStopRe.MatchString(p) && m == http.MethodPost)
 		if isExecute {
